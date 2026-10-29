@@ -85,7 +85,7 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
             assert (root / "Caddyfile").read_text() == original
             candidates = manager.containers()
             choice = str(next(i for i, c in enumerate(candidates, 1) if c["Name"].lstrip("/") == app))
-            with mock.patch.object(edge, "ask", side_effect=["generic.test", choice, "8000"]), mock.patch.object(edge, "yes", side_effect=[False, False]):
+            with mock.patch.object(edge, "ask", side_effect=["generic.test", "d", choice, "8000"]), mock.patch.object(edge, "yes", return_value=False):
                 manager.add()
             assert (root / "Caddyfile").read_text() == original
             assert network not in manager.container()["NetworkSettings"]["Networks"]
@@ -98,7 +98,7 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
                     pass
             assert network not in manager.container()["NetworkSettings"]["Networks"]
             assert not (root / edge.OVERLAY).exists()
-            with mock.patch.object(edge, "ask", side_effect=["generic.test", choice, "8000"]), mock.patch.object(edge, "yes", side_effect=[False, True]):
+            with mock.patch.object(edge, "ask", side_effect=["generic.test", "d", choice, "8000"]), mock.patch.object(edge, "yes", return_value=True):
                 manager.add()
             assert manager.container()["Id"] == original_container
             assert network in manager.container()["NetworkSettings"]["Networks"]
@@ -106,10 +106,11 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
             print("PASS 通用精简向导选择真实容器与端口，确认后接入网络，取消无变更，失败回退网络；未重建入口及后端")
             password = "1"
             hashed = manager.exec("caddy", "hash-password", data=password + "\n").strip()
-            value = {"domain": "panel.test", "mode": "https", "upstream": "http://%s:8000" % app,
-                     "enabled": True, "compress": True, "allow": [], "body_mb": 4, "mihomo": True,
+            value = {"domain": "app.test", "mode": "https", "upstream": "http://%s:8000" % app,
+                     "enabled": True, "compress": True, "allow": [], "body_mb": 4,
                      "auth": {"user": "admin", "hash": hashed},
-                     "routes": [{"prefix": "/mihomo", "upstream": "http://%s:8000" % app, "strip": True, "auth": False}]}
+                     "routes": [{"prefix": "/api", "upstream": "http://%s:8000" % app, "strip": True, "auth": False},
+                                {"prefix": "/auth", "upstream": "http://%s:8000" % app, "strip": False, "auth": False}]}
             manager.apply([value])
             assert (root / "Caddyfile").read_text().startswith(original)
             for _ in range(50):
@@ -138,33 +139,33 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
                         time.sleep(.2)
             auth = "Basic " + base64.b64encode(b"admin:1").decode()
             assert request("legacy.test")[1] == b"legacy-ok"
-            assert request("panel.test")[0] == 401
-            assert request("panel.test", "/config.js")[0] == 401
-            assert request("panel.test", authorization=auth)[0] == 200
-            assert request("panel.test", authorization="Basic " + base64.b64encode(b"admin:wrong").decode())[0] == 401
-            code, body = request("panel.test", "/mihomo/version", "Bearer API-TEST")
+            assert request("app.test")[0] == 401
+            assert request("app.test", "/assets/app.js")[0] == 401
+            assert request("app.test", authorization=auth)[0] == 200
+            assert request("app.test", authorization="Basic " + base64.b64encode(b"admin:wrong").decode())[0] == 401
+            code, body = request("app.test", "/api/version", "Bearer API-TEST")
             assert code == 200 and json.loads(body) == {"path": "/version", "auth": "Bearer API-TEST"}
-            code, body = request("panel.test", "/api/control/profiles", "Bearer CONTROL-TEST")
-            assert code == 200 and json.loads(body)["auth"] == "Bearer CONTROL-TEST"
-            assert request("panel.test", "/mihomo/traffic", "Bearer API-TEST", websocket=True)[0] == 101
-            print("PASS 真实 HTTPS（临时内部 CA）、Basic 正误密码、面板资源保护、路径分流、Bearer 转发及 WebSocket 101")
+            code, body = request("app.test", "/auth/session", "Bearer TOKEN-TEST")
+            assert code == 200 and json.loads(body) == {"path": "/auth/session", "auth": "Bearer TOKEN-TEST"}
+            assert request("app.test", "/api/traffic", "Bearer API-TEST", websocket=True)[0] == 101
+            print("PASS 真实 HTTPS（临时内部 CA）、Basic 正误密码、网站资源保护、路径分流、Bearer 转发及 WebSocket 101")
             before_routes = manager.sites()[0]
             with mock.patch.object(edge, "ask", side_effect=["1", "/service", "http://%s:8000" % app]), mock.patch.object(edge, "yes", side_effect=[True, False, True]):
                 manager.route()
             after_routes = manager.sites()[0]
             assert after_routes["routes"][:-1] == before_routes["routes"]
             assert {k: v for k, v in after_routes.items() if k != "routes"} == {k: v for k, v in before_routes.items() if k != "routes"}
-            code, body = request("panel.test", "/service/version", "Bearer SERVICE-TEST")
+            code, body = request("app.test", "/service/version", "Bearer SERVICE-TEST")
             assert code == 200 and json.loads(body) == {"path": "/version", "auth": "Bearer SERVICE-TEST"}
-            assert request("panel.test", "/config.js")[0] == 401
+            assert request("app.test", "/assets/app.js")[0] == 401
             print("PASS 独立路径操作只修改目标路由，直接填写地址，主后端、旧分流、密码及其他选项保持")
             restricted = copy.deepcopy(value)
             restricted["allow"] = ["192.0.2.0/24"]
             manager.apply([restricted])
-            assert request("panel.test", authorization=auth)[0] == 403
-            assert request("panel.test", "/mihomo/version", "Bearer API-TEST")[0] == 403
+            assert request("app.test", authorization=auth)[0] == 403
+            assert request("app.test", "/api/version", "Bearer API-TEST")[0] == 403
             manager.apply([value])
-            print("PASS IP 白名单在面板及 API 上真实生效")
+            print("PASS IP 白名单在网站及 API 上真实生效")
             old = (root / "Caddyfile").read_bytes()
             execute = manager.exec
             failed = [False]

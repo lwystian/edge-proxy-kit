@@ -171,6 +171,26 @@ def prefix(value):
     return value.rstrip("/")
 
 
+def site_address(value, current_mode="https"):
+    """域名默认 HTTPS；显式 http:// 地址用于内网 HTTP。"""
+    if value and "://" in value:
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != parsed.hostname or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise Error("网站填写域名，或 http://域名；不含端口、路径或凭据。")
+        return domain(parsed.hostname), parsed.scheme
+    return domain(value), current_mode
+
+
+def route_rules(site):
+    rules = [("path%s" % i, route) for i, route in enumerate(sorted(site.get("routes", []), key=lambda r: -len(r["prefix"])))]
+    # 仅兼容早期站点记录，保持已加载的配置逐字一致；新站点不写入应用标记。
+    if site.get("mihomo"):
+        if any(r["prefix"] == "/api" or r["prefix"].startswith("/api/control") for r in site.get("routes", [])):
+            raise Error("旧记录已有此路径规则，不能重复添加分流。")
+        rules.append(("control", {"prefix": "/api/control", "upstream": site["upstream"], "strip": False, "auth": False}))
+    return rules
+
+
 def validate_site(site):
     if site.get("domain") != domain(site.get("domain")) or site.get("mode") not in ("https", "http"):
         raise Error("站点域名或访问模式无效。")
@@ -192,8 +212,7 @@ def validate_site(site):
             raise Error("路径前缀重复。")
         seen.add(path)
         upstream(route.get("upstream"))
-        if site.get("mihomo") and (path == "/api" or path.startswith("/api/control")):
-            raise Error("旧版兼容规则已占用此控制接口路径，不能重复添加分流。")
+    route_rules(site)
     for cidr in site.get("allow", []):
         try:
             ipaddress.ip_network(cidr, strict=False)
@@ -231,14 +250,11 @@ def render_site(site):
                    "\t\t\ttransport http {", "\t\t\t\tdial_timeout 5s", "\t\t\t}", "\t\t}", "\t}"]
         return result
 
-    for index, route in enumerate(sorted(site.get("routes", []), key=lambda r: -len(r["prefix"]))):
+    for matcher, route in route_rules(site):
         path = route["prefix"]
-        lines += ["\t@path%s path %s %s/*" % (index, path, path)]
-        lines += handle(route["upstream"], "@path%s" % index,
+        lines += ["\t@%s path %s %s/*" % (matcher, path, path)]
+        lines += handle(route["upstream"], "@" + matcher,
                         path if route.get("strip", True) else None, route.get("auth", True))
-    if site.get("mihomo"):
-        lines += ["\t@control path /api/control /api/control/*"]
-        lines += handle(site["upstream"], "@control", authentication=False)
     lines += handle(site["upstream"])
     # route 保留顺序：IP 拒绝必须发生在 handle/reverse_proxy 之前。
     return lines[0] + "\n\troute {\n" + "\n".join("\t" + line for line in lines[1:]) + "\n\t}\n}\n"
@@ -398,8 +414,7 @@ class Manager:
             except Exception:
                 raise Error("加载及回退加载均失败，原配置已写回。请检查入口状态；备份：" + str(snapshot))
             raise Error("配置加载失败，已恢复原配置及站点记录；备份：" + str(snapshot))
-        print("配置已验证并平滑加载。HTTPS 证书申请异步进行，请用 doctor 和浏览器检查。")
-        print("已有 WebSocket 连接可能随配置加载重连；后端应用、证书卷均未重建。")
+        print("配置已验证并平滑加载。首次启用 HTTPS 后，请通过浏览器检查证书。")
 
     def hash_password(self, current_hash=None):
         while True:
@@ -428,7 +443,7 @@ class Manager:
 
     def list_containers(self, values=None):
         values = self.containers() if values is None else values
-        print("选择提供网页/API 的容器；端口来自发布/声明信息，不保证正在监听。")
+        print("Docker 容器（端口为候选值，请选择实际 HTTP 服务端口）：")
         for index, container in enumerate(values, 1):
             ports = ", ".join(str(p) for p in container_ports(container)) or "未声明，可手输"
             print("%s. %s  端口：%s" % (index, container["Name"].lstrip("/"), ports))
@@ -436,17 +451,23 @@ class Manager:
 
     def backend(self, default=None, pending=None):
         pending = pending if pending is not None else set()
-        values = self.list_containers()
-        print("0. 手动填写地址" + ("；直接回车保留当前后端" if default else ""))
-        selected = ask("填后端地址或容器序号", "" if default else ("1" if len(values) == 1 else None))
-        if not selected and default:
+        selected = ask("后端地址（IP:端口/域名:端口，输入 d 选择容器）", default)
+        if selected == default and default:
             return default
-        if selected in ("0", None, "") or (isinstance(selected, str) and not selected.isdecimal()):
-            address = upstream(ask("后端地址，例如 http://服务地址:端口", default) if selected in ("0", None, "") else selected)
+        values = None
+        if selected and selected.lower() in ("d", "docker"):
+            values = self.list_containers()
+            selected = ask("选择容器序号，0 返回", "1" if len(values) == 1 else "0")
+            if selected == "0":
+                return self.backend(default, pending)
+            if not selected or not selected.isdecimal():
+                raise Error("请选择列表中的容器序号。")
+        else:
+            address = upstream(ask("后端地址", default) if selected == "0" else selected)
             parsed = urllib.parse.urlsplit(address)
             number = parsed.port or (443 if parsed.scheme == "https" else 80)
             loopback = any(b.get("HostIp") in ("127.0.0.1", "::1") and int(b.get("HostPort", 0)) == number
-                           for c in values for bindings in (c.get("NetworkSettings", {}).get("Ports", {}) or {}).values()
+                           for c in self.containers() for bindings in (c.get("NetworkSettings", {}).get("Ports", {}) or {}).values()
                            for b in bindings or [])
             if loopback:
                 print("本机 Docker 的端口 %s 存在仅绑定回环地址的映射；若填的是本机公网 IP，不能通过它访问该服务，建议直接选择容器。" % number)
@@ -515,13 +536,10 @@ class Manager:
         if editing and previous is None:
             raise Error("只能交互编辑本工具创建的站点；原有手写站点保持原样。")
         pending = set()
-        site = copy.deepcopy(previous) if previous else {"enabled": True, "compress": True, "allow": [], "body_mb": 0}
-        site["domain"] = domain(ask("网站域名", editing))
-        site.setdefault("mode", "https")
+        site = copy.deepcopy(previous) if previous else {"enabled": True}
+        site["domain"], site["mode"] = site_address(ask("网站域名（默认 HTTPS）", editing), site.get("mode", "https"))
         site["upstream"] = self.backend(site.get("upstream"), pending)
         site.setdefault("routes", [])
-        if yes("需要更多设置？"):
-            self.options(site, pending)
         self.save_site(sites, site, pending, editing)
 
     def save_site(self, sites, site, pending, editing):
@@ -583,7 +601,7 @@ class Manager:
                     return True
         path = prefix(ask("路径前缀，例如 /api", route["prefix"] if route else None))
         target = self.backend(route["upstream"] if route else None, pending)
-        strip = yes("转发时去掉此前缀？", route.get("strip", True) if route else True)
+        strip = yes("转发时去掉此前缀？", route.get("strip", True) if route else False)
         auth = yes("此路径也要求网页登录密码？", route.get("auth", True) if route else True) if site.get("auth") else False
         if any(r is not route and r["prefix"] == path for r in routes):
             raise Error("此路径已存在，请选择修改，不要重复新增。")
@@ -602,56 +620,32 @@ class Manager:
         if self.route_form(site, pending):
             self.save_site(sites, site, pending, site["domain"])
 
-    def options(self, site, pending):
-        while True:
-            print("1 HTTPS/HTTP  2 后端协议  3 登录密码  4 IP 白名单\n5 上传限制  6 压缩  7 路径分流  0 完成")
-            selected = ask("只选择需要修改的项目", "0")
-            if selected == "0":
-                return
-            if selected == "1":
-                site["mode"] = "https" if yes("使用自动 HTTPS？", site["mode"] == "https") else "http"
-            elif selected == "2":
-                parsed = urllib.parse.urlsplit(site["upstream"])
-                scheme = ask("后端协议（http/https/h2c）", parsed.scheme)
-                site["upstream"] = upstream(urllib.parse.urlunsplit(parsed._replace(scheme=scheme)))
-            elif selected == "3":
-                if yes("启用网页登录密码？", bool(site.get("auth"))):
-                    old = site.get("auth") or {}
-                    site["auth"] = {"user": ask("访问用户名", old.get("user", "admin")), "hash": self.hash_password(old.get("hash"))}
-                    print("Basic Auth 占用 Authorization；使用 Bearer 的 API 路径应关闭额外网页登录认证。")
-                else:
-                    site.pop("auth", None)
-            elif selected == "4":
-                allow = ask("IP/CIDR，逗号分隔，- 清空；回车保留", ",".join(site.get("allow", []))) or ""
-                site["allow"] = [] if allow == "-" else [s.strip() for s in allow.split(",") if s.strip()]
-            elif selected == "5":
-                site["body_mb"] = int(ask("请求体上限 MiB，0 为不限", str(site.get("body_mb", 0))))
-            elif selected == "6":
-                site["compress"] = yes("启用压缩？", site.get("compress", True))
-            elif selected == "7":
-                self.route_form(site, pending)
-            else:
-                raise Error("无效选择。")
-
     def edit(self):
         sites, site = self.choose_site()
         if site is None:
             return
         original = site["domain"]
         pending = set()
-        print("1 修改后端  2 修改域名  3 路径分流  4 更多设置  0 取消")
+        print("1 后端  2 域名  3 路径分流  4 访问密码  5 HTTPS/HTTP  0 取消")
         selected = ask("修改哪一项", "0")
         if selected == "0":
             return
         if selected == "1":
             site["upstream"] = self.backend(site["upstream"], pending)
         elif selected == "2":
-            site["domain"] = domain(ask("网站域名", original))
+            site["domain"], site["mode"] = site_address(ask("网站域名", original), site["mode"])
         elif selected == "3":
             if not self.route_form(site, pending):
                 return
         elif selected == "4":
-            self.options(site, pending)
+            if yes("启用访问密码？", bool(site.get("auth"))):
+                old = site.get("auth") or {}
+                site["auth"] = {"user": ask("访问用户名", old.get("user", "admin")), "hash": self.hash_password(old.get("hash"))}
+                print("Basic Auth 使用 Authorization；需要 Bearer 的路径可单独关闭此认证。")
+            else:
+                site.pop("auth", None)
+        elif selected == "5":
+            site["mode"] = "https" if yes("使用自动 HTTPS？", site["mode"] == "https") else "http"
         else:
             raise Error("无效选择。")
         self.save_site(sites, site, pending, original)
@@ -988,9 +982,9 @@ def update_image(manager, image=None):
 
 
 def menu():
-    print("1 新增网站  2 管理网站  3 状态  4 日志\n5 更新  6 更多操作  7 路径分流  0 退出")
+    print("1 新增网站  2 管理网站  3 状态  4 日志\n5 更新  6 维护  0 退出")
     choice = ask("选择", "0")
-    direct = {"1": "add", "3": "status", "4": "logs", "5": "update", "7": "route"}
+    direct = {"1": "add", "3": "status", "4": "logs", "5": "update"}
     if choice == "0":
         return None
     if choice in direct:

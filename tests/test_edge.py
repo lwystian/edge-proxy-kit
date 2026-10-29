@@ -69,12 +69,15 @@ class EdgeTests(unittest.TestCase):
         self.assertNotIn("tls_insecure_skip_verify", text)
         self.assertNotIn("Authorization", text)
 
-    def test_mihomo_bearer_routes_do_not_inherit_basic_auth(self):
+    def test_old_application_record_remains_byte_compatible(self):
         value = site(mihomo=True, auth={"user": "admin", "hash": HASH},
                      routes=[{"prefix": "/mihomo", "upstream": "http://mihomo:9091", "strip": True, "auth": False}])
         text = edge.render_site(value)
         self.assertEqual(text.count("basic_auth"), 1)
         self.assertIn("@control path /api/control /api/control/*", text)
+        ordinary = copy.deepcopy(value)
+        ordinary.pop("mihomo")
+        self.assertNotIn("@control", edge.render_site(ordinary))
         value["routes"].append({"prefix": "/api", "upstream": "app:8000"})
         with self.assertRaises(edge.Error):
             edge.render_site(value)
@@ -182,7 +185,7 @@ class EdgeTests(unittest.TestCase):
         pending = set()
         with mock.patch.object(self.manager, "containers", return_value=[self.backend_container()]), \
              mock.patch.object(self.manager, "container", return_value={"Id": "proxy", "NetworkSettings": {"Networks": {"shared": {}}}}), \
-             mock.patch.object(edge, "ask", side_effect=["1", "9090"]), mock.patch.object(self.manager, "connect_network") as connect:
+             mock.patch.object(edge, "ask", side_effect=["d", "1", "9090"]), mock.patch.object(self.manager, "connect_network") as connect:
             self.assertEqual(self.manager.backend(pending=pending), "http://real-app-1:9090")
             connect.assert_not_called()
         self.assertEqual(pending, {"backend-net"})
@@ -191,7 +194,7 @@ class EdgeTests(unittest.TestCase):
         pending = set()
         with mock.patch.object(self.manager, "containers", return_value=[self.backend_container(shared=True)]), \
              mock.patch.object(self.manager, "container", return_value={"NetworkSettings": {"Networks": {"shared": {}}}}), \
-             mock.patch.object(edge, "ask", side_effect=["1", "9090"]):
+             mock.patch.object(edge, "ask", side_effect=["d", "1", "9090"]):
             self.manager.backend(pending=pending)
         self.assertEqual(pending, set())
 
@@ -206,19 +209,20 @@ class EdgeTests(unittest.TestCase):
     def test_simple_add_has_no_application_preset_or_raw_config_and_cancel_changes_nothing(self):
         before = (self.root / "Caddyfile").read_bytes()
         with mock.patch.object(edge, "ask", return_value="new.example.test") as ask, \
-             mock.patch.object(edge, "yes", side_effect=[False, False]), \
+             mock.patch.object(edge, "yes", return_value=False) as confirm, \
              mock.patch.object(self.manager, "backend", return_value="http://app:8000"), \
              mock.patch.object(self.manager, "apply_with_networks") as apply, \
              contextlib.redirect_stdout(io.StringIO()) as output:
             self.manager.add()
-            ask.assert_called_once_with("网站域名", None)
+            ask.assert_called_once_with("网站域名（默认 HTTPS）", None)
+            confirm.assert_called_once_with("确认备份并应用？", True)
             apply.assert_not_called()
         self.assertNotIn("MetaCubeXD", output.getvalue())
         self.assertNotIn("reverse_proxy", output.getvalue())
         self.assertEqual((self.root / "Caddyfile").read_bytes(), before)
 
     def test_compact_menu_keeps_common_commands_and_groups_advanced_actions(self):
-        for answers, expected in ((["1"], "add"), (["2", "4"], "disable"), (["6", "2"], "containers"), (["5"], "update"), (["7"], "route"), (["0"], None)):
+        for answers, expected in ((["1"], "add"), (["2", "4"], "disable"), (["6", "2"], "containers"), (["5"], "update"), (["0"], None)):
             with mock.patch.object(edge, "ask", side_effect=answers), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(edge.menu(), expected)
                 self.assertNotIn("MetaCubeXD", output.getvalue())
@@ -229,11 +233,11 @@ class EdgeTests(unittest.TestCase):
         with mock.patch.object(edge, "ask", return_value="/api") as ask, \
              mock.patch.object(edge, "yes", side_effect=[True, False, True]), \
              mock.patch.object(self.manager, "backend", return_value="https://api.example.test"), \
-             mock.patch.object(self.manager, "options") as options, \
+             mock.patch.object(self.manager, "hash_password") as password, \
              mock.patch.object(self.manager, "apply_with_networks") as apply:
             self.manager.route()
             ask.assert_called_once_with("路径前缀，例如 /api", None)
-            options.assert_not_called()
+            password.assert_not_called()
         updated = apply.call_args[0][0][0]
         self.assertEqual(updated["routes"], [{"prefix": "/api", "upstream": "https://api.example.test", "strip": True, "auth": False}])
         updated["routes"] = []
@@ -251,16 +255,15 @@ class EdgeTests(unittest.TestCase):
         self.assertFalse(value["routes"][0]["auth"])
         self.assertEqual(value["routes"][1], other)
 
-    def test_options_only_prompts_the_selected_setting(self):
+    def test_edit_password_preserves_other_saved_options(self):
         value = site(auth={"user": "admin", "hash": HASH}, allow=["192.0.2.0/24"])
         original = copy.deepcopy(value)
-        with mock.patch.object(edge, "ask", side_effect=["5", "128", "0"]), \
-             mock.patch.object(self.manager, "hash_password") as password, mock.patch.object(self.manager, "backend") as backend:
-            self.manager.options(value, set())
-            password.assert_not_called()
+        edge.write_json(self.root / edge.CATALOG, [value])
+        with mock.patch.object(edge, "ask", side_effect=["4", "new-user"]), mock.patch.object(edge, "yes", return_value=True), mock.patch.object(self.manager, "hash_password", return_value=HASH), mock.patch.object(self.manager, "backend") as backend, mock.patch.object(self.manager, "apply_with_networks") as apply:
+            self.manager.edit()
             backend.assert_not_called()
-        original["body_mb"] = 128
-        self.assertEqual(value, original)
+        original["auth"]["user"] = "new-user"
+        self.assertEqual(apply.call_args[0][0], [original])
 
     def test_cancel_route_does_not_apply_or_replace_saved_catalog(self):
         edge.write_json(self.root / edge.CATALOG, [site()])
@@ -276,16 +279,41 @@ class EdgeTests(unittest.TestCase):
         edge.write_json(self.root / edge.CATALOG, [site()])
         with mock.patch.object(edge, "ask", return_value="1"), \
              mock.patch.object(self.manager, "backend", return_value=site()["upstream"]), \
-             mock.patch.object(self.manager, "options") as options, \
+             mock.patch.object(self.manager, "hash_password") as password, \
              mock.patch.object(self.manager, "apply_with_networks") as apply:
             self.manager.edit()
-            options.assert_not_called()
+            password.assert_not_called()
             apply.assert_not_called()
 
     def test_backend_accepts_direct_remote_address_without_selecting_manual_mode(self):
-        with mock.patch.object(self.manager, "containers", return_value=[]), mock.patch.object(edge, "ask", return_value="https://remote.example.test:8443") as ask:
+        with mock.patch.object(self.manager, "containers", return_value=[]), mock.patch.object(edge, "ask", return_value="https://remote.example.test:8443") as ask, mock.patch.object(self.manager, "list_containers") as listing:
             self.assertEqual(self.manager.backend(), "https://remote.example.test:8443")
+            listing.assert_not_called()
         self.assertEqual(ask.call_count, 1)
+
+    def test_site_address_defaults_to_https_and_allows_explicit_http(self):
+        self.assertEqual(edge.site_address("app.example.com"), ("app.example.com", "https"))
+        self.assertEqual(edge.site_address("http://192.0.2.10"), ("192.0.2.10", "http"))
+        self.assertEqual(edge.site_address("https://APP.EXAMPLE.COM/"), ("app.example.com", "https"))
+        self.assertEqual(edge.site_address("new.example.com", "http"), ("new.example.com", "http"))
+        for value in ("http://app.example.com:8080", "http://user:pass@app.example.com", "https://app.example.com/path", "ftp://app.example.com"):
+            with self.subTest(value=value), self.assertRaises(edge.Error):
+                edge.site_address(value)
+
+    def test_new_site_contains_only_generic_fields_and_two_inputs(self):
+        with mock.patch.object(edge, "ask", side_effect=["app.example.com", "198.51.100.10:8080"]) as ask, mock.patch.object(edge, "yes", return_value=True) as confirm, mock.patch.object(self.manager, "containers", return_value=[]), mock.patch.object(self.manager, "apply_with_networks") as apply:
+            self.manager.add()
+        self.assertEqual(ask.call_count, 2)
+        confirm.assert_called_once_with("确认备份并应用？", True)
+        self.assertEqual(apply.call_args[0], ([{"domain": "app.example.com", "mode": "https", "enabled": True,
+                                              "upstream": "http://198.51.100.10:8080", "routes": []}], set()))
+
+    def test_new_routes_keep_original_path_by_default_and_use_existing_site_auth(self):
+        value = site(auth={"user": "admin", "hash": HASH})
+        with mock.patch.object(edge, "ask", return_value="/api"), mock.patch.object(self.manager, "backend", return_value="http://api:8000"), mock.patch.object(edge, "yes", side_effect=lambda prompt, default=False: default) as confirm:
+            self.manager.route_form(value, set())
+        self.assertEqual(value["routes"], [{"prefix": "/api", "upstream": "http://api:8000", "strip": False, "auth": True}])
+        self.assertEqual(confirm.call_args_list, [mock.call("转发时去掉此前缀？", False), mock.call("此路径也要求网页登录密码？", True)])
 
     def test_network_change_is_rolled_back_if_site_apply_fails(self):
         original = {"services": {"caddy": {"image": edge.IMAGE}}}
