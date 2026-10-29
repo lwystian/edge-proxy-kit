@@ -2,25 +2,28 @@
 
 开发日期：2026-10-29。未连接或修改用户服务器。
 
-本地 Windows 已执行 Bash 语法检查、Python 编译及 28 项逻辑测试：27 项通过，1 项 Linux 脚本执行测试明确跳过。
+本地 Windows 已执行 Bash 语法检查、Python 编译及 35 项逻辑测试：34 项通过，1 项 Linux 脚本执行测试明确跳过。
 
 覆盖输入验证、路径分流、认证分离、私有备份、原站点保护、原 inode 保持、加载失败回退、损坏备份拒绝、同名项目保护、密码回车保留、卸载范围，以及本地临时 Git 仓库中的安全快进、私有文件保护、本地改动和文件冲突拒绝。
 
+新增覆盖通用精简菜单、真实容器名选择、发布/声明端口候选、回环端口提示、共享网络复用、取消无变更及网络回退。新增网站不再提供应用专用预设，旧记录继续兼容。
+
 ## Linux 与真实容器：已通过
 
-- 验证代码：`da1b9f99b4623c6488eae34d7087ed09389c2573`。
-- [GitHub Actions 完整成功记录](https://github.com/lwystian/edge-proxy-kit/actions/runs/40851981925)。
-- 独立 Ubuntu 24.04 x86_64 临时 runner，28 项逻辑测试全部通过，Bash 及 Python 语法检查通过。
+- 验证代码：`61902838d88c7b4b7a34b834c1f729bf8df182f5`。
+- [GitHub Actions 完整成功记录](https://github.com/lwystian/edge-proxy-kit/actions/runs/40864963502)。
+- 独立 Ubuntu 24.04 x86_64 临时 runner，35 项逻辑测试全部通过，Bash 及 Python 语法检查通过。
 - 实际使用官方 Caddy `2.11.4-alpine` 和一个临时 Python HTTP 后端；仅临时测试项目创建网络、容器和证书。
 - 实际执行全新入口安装，发布标准 TCP 80/443，验证目录、启动及健康检查。
 - 接管现有测试入口后，原 Caddyfile 和 Caddy 容器 ID 保持不变。
 - Docker 网络接入即时生效，覆盖文件经真实 Compose 验证；更新重建后网络仍保留，后端容器未重启。
+- 真实新增向导通过序号选择实际容器及端口：取消后 Caddyfile 和网络未变；确认后网络才接入。模拟配置失败后，新接入网络和覆盖文件均回退。
 - 真实 HTTPS 使用测试专属 Caddy 内部 CA，验证证书链与主机名；不将其视为公开受信任证书。
 - 验证 Basic 正确/错误密码、未认证面板及 `/config.js` 拒绝、Mihomo/Control API 的 Bearer 转发与路径处理、WebSocket 101。
 - 实际 IP 白名单同时限制面板及 API；原网站仍可访问。
 - 实际备份、加载失败自动回退、恢复、镜像更新及卸载；原证书文件不变，卸载后配置、证书和后端容器仍在。
 
-该测试使用普通回显后端验证 MetaCubeXD 路由和请求头；没有在此仓库的 CI 启动真实 MetaCubeXD、执行其网页登录或业务操作。模板路径设计另核对了上游 v1.273.1 的 HTTP prefix、WebSocket endpoint 和控制接口实现。
+API 路由测试使用普通回显后端，并继续验证旧版本兼容规则；没有在此仓库的 CI 启动真实第三方业务应用或执行其登录、写入操作。
 
 Windows 本机未启动 Docker Engine，未在本机重复执行容器测试；`tests/integration.py` 不带 `--run` 只输出 SKIP，不计为通过。
 
