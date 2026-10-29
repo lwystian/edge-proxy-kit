@@ -1,0 +1,13 @@
+/settings.json
+/Caddyfile
+/compose.yaml
+/compose.edge-kit.yaml
+/.env
+/.edge-kit/
+/data/
+/config/
+__pycache__/
+*.pyc
+*.log
+*.tar.gz
+*.sha256

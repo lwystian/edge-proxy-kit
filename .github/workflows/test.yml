@@ -1,0 +1,24 @@
+name: 验证 Edge Proxy Kit
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: 语法、交互及失败保护测试
+        run: |
+          bash -n deploy.sh
+          ./deploy.sh help
+          python3 -m py_compile edge.py tests/test_edge.py tests/integration.py
+          python3 tests/test_edge.py
+      - name: Caddy 真实容器、HTTPS、认证、网络及恢复测试
+        run: sudo /usr/bin/python3 tests/integration.py --run
+      - name: 输出仅供测试使用的失败诊断
+        if: failure()
+        run: sudo sh -c 'if [ -f .edge-kit/last-error.log ]; then cat .edge-kit/last-error.log; fi'
