@@ -148,6 +148,16 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
             assert code == 200 and json.loads(body)["auth"] == "Bearer CONTROL-TEST"
             assert request("panel.test", "/mihomo/traffic", "Bearer API-TEST", websocket=True)[0] == 101
             print("PASS 真实 HTTPS（临时内部 CA）、Basic 正误密码、面板资源保护、路径分流、Bearer 转发及 WebSocket 101")
+            before_routes = manager.sites()[0]
+            with mock.patch.object(edge, "ask", side_effect=["1", "/service", "http://%s:8000" % app]), mock.patch.object(edge, "yes", side_effect=[True, False, True]):
+                manager.route()
+            after_routes = manager.sites()[0]
+            assert after_routes["routes"][:-1] == before_routes["routes"]
+            assert {k: v for k, v in after_routes.items() if k != "routes"} == {k: v for k, v in before_routes.items() if k != "routes"}
+            code, body = request("panel.test", "/service/version", "Bearer SERVICE-TEST")
+            assert code == 200 and json.loads(body) == {"path": "/version", "auth": "Bearer SERVICE-TEST"}
+            assert request("panel.test", "/config.js")[0] == 401
+            print("PASS 独立路径操作只修改目标路由，直接填写地址，主后端、旧分流、密码及其他选项保持")
             restricted = copy.deepcopy(value)
             restricted["allow"] = ["192.0.2.0/24"]
             manager.apply([restricted])

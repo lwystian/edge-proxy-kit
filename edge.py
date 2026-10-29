@@ -368,7 +368,7 @@ class Manager:
         print("配置备份：" + str(directory))
         return directory
 
-    def apply(self, sites, base=None):
+    def apply(self, sites, base=None, snapshot=None):
         old = self.current()
         original, block = split_config(old)
         if block != managed(self.sites()):
@@ -383,7 +383,7 @@ class Manager:
             original += "\n"
         candidate = original + BEGIN + managed(sites) + END
         self.adapt(candidate)
-        snapshot = self.backup()
+        snapshot = self.backup() if snapshot is None else snapshot
         previous = self.sites()
         try:
             inplace(self.root / "Caddyfile", candidate)
@@ -438,11 +438,11 @@ class Manager:
         pending = pending if pending is not None else set()
         values = self.list_containers()
         print("0. 手动填写地址" + ("；直接回车保留当前后端" if default else ""))
-        selected = ask("选择后端容器序号", "" if default else ("1" if len(values) == 1 else None))
+        selected = ask("填后端地址或容器序号", "" if default else ("1" if len(values) == 1 else None))
         if not selected and default:
             return default
-        if selected in ("0", None, ""):
-            address = upstream(ask("后端地址，例如 http://服务地址:端口", default))
+        if selected in ("0", None, "") or (isinstance(selected, str) and not selected.isdecimal()):
+            address = upstream(ask("后端地址，例如 http://服务地址:端口", default) if selected in ("0", None, "") else selected)
             parsed = urllib.parse.urlsplit(address)
             number = parsed.port or (443 if parsed.scheme == "https" else 80)
             loopback = any(b.get("HostIp") in ("127.0.0.1", "::1") and int(b.get("HostPort", 0)) == number
@@ -494,11 +494,11 @@ class Manager:
         before_networks = set(obj["NetworkSettings"]["Networks"])
         overlay = self.root / OVERLAY
         old = overlay.read_bytes() if overlay.exists() else None
-        self.backup()
+        snapshot = self.backup()
         try:
             for network in sorted(pending):
-                self.connect_network(network, approved=True)
-            self.apply(sites)
+                self.connect_network(network, approved=True, snapshot=snapshot)
+            self.apply(sites, snapshot=snapshot)
         except Exception:
             if old is None:
                 overlay.unlink(missing_ok=True)
@@ -520,37 +520,141 @@ class Manager:
         site.setdefault("mode", "https")
         site["upstream"] = self.backend(site.get("upstream"), pending)
         site.setdefault("routes", [])
-        if yes("高级设置（HTTP、访问密码、路径分流等）？"):
-            site["mode"] = "https" if yes("使用自动 HTTPS？", site["mode"] == "https") else "http"
-            parsed = urllib.parse.urlsplit(site["upstream"])
-            scheme = ask("后端协议（http/https/h2c）", parsed.scheme)
-            site["upstream"] = upstream(urllib.parse.urlunsplit(parsed._replace(scheme=scheme)))
-            if yes("启用网页登录密码？", bool(site.get("auth"))):
-                site["auth"] = {"user": ask("访问用户名", (site.get("auth") or {}).get("user", "admin")), "hash": self.hash_password((site.get("auth") or {}).get("hash"))}
-                print("Basic Auth 占用 Authorization；后端若也用 Bearer，请为 API 配置独立且免 Basic 的路径。")
-            else:
-                site.pop("auth", None)
-            allow = ask("允许的 IP/CIDR，逗号分隔，- 清空；回车保留", ",".join(site.get("allow", []))) or ""
-            site["allow"] = ("" if allow == "-" else allow).replace(" ", "").split(",")
-            site["allow"] = [x for x in site["allow"] if x]
-            site["compress"] = yes("启用压缩？", site.get("compress", True))
-            site["body_mb"] = int(ask("请求体上限 MiB，0 为不额外限制", str(site.get("body_mb", 0))))
-            if site["routes"] and not site.get("mihomo") and yes("清空已有路径分流，重新配置？"):
-                site["routes"] = []
-            while yes("增加一个路径分流？"):
-                path = prefix(ask("路径前缀，例如 /api"))
-                site["routes"].append({"prefix": path, "upstream": self.backend(pending=pending), "strip": yes("转发时去掉此前缀？", True),
-                                       "auth": yes("此路径也要求网页登录密码？", True) if site.get("auth") else False})
+        if yes("需要更多设置？"):
+            self.options(site, pending)
+        self.save_site(sites, site, pending, editing)
+
+    def save_site(self, sites, site, pending, editing):
         validate_site(site)
+        if editing and not pending and next((s for s in sites if s["domain"] == editing), None) == site:
+            print("未作修改，无需备份或重新加载。")
+            return
         if any(s["domain"] == site["domain"] and s["domain"] != editing for s in sites):
             raise Error("此域名已存在。")
         print("\n网站：%s://%s\n后端：%s\n访问密码：%s" % (site["mode"], site["domain"], site["upstream"], "已启用" if site.get("auth") else "未启用"))
         if site["routes"]:
-            print("路径分流：" + ", ".join(r["prefix"] for r in site["routes"]))
+            for route in site["routes"]:
+                print("%s → %s（%s前缀）" % (route["prefix"], route["upstream"], "去掉" if route.get("strip", True) else "保留"))
         if pending:
             print("入口将接入网络：%s（保留原网络，不重启后端）" % ", ".join(sorted(pending)))
         if yes("确认备份并应用？", True):
             self.apply_with_networks([s for s in sites if s["domain"] != editing] + [site], pending)
+
+    def choose_site(self):
+        sites = self.sites()
+        if not sites:
+            raise Error("还没有托管网站，请先运行 add。")
+        if len(sites) == 1:
+            print("网站：" + sites[0]["domain"])
+            return sites, copy.deepcopy(sites[0])
+        for i, site in enumerate(sites, 1):
+            print("%s. %s" % (i, site["domain"]))
+        selected = ask("选择网站序号或域名，0 取消", "0")
+        if selected == "0":
+            return sites, None
+        if selected and selected.isdecimal() and 1 <= int(selected) <= len(sites):
+            return sites, copy.deepcopy(sites[int(selected) - 1])
+        match = next((s for s in sites if s["domain"] == selected), None)
+        if not match:
+            raise Error("请选择列表中的托管网站；原有手写站点保持原样。")
+        return sites, copy.deepcopy(match)
+
+    def route_form(self, site, pending):
+        routes = site.setdefault("routes", [])
+        route = None
+        if routes:
+            for index, current in enumerate(routes, 1):
+                print("%s. %s → %s" % (index, current["prefix"], current["upstream"]))
+            action = ask("1 新增  2 修改  3 移除  0 取消", "1")
+            if action == "0":
+                return False
+            if action not in ("1", "2", "3"):
+                raise Error("无效操作。")
+            if action in ("2", "3"):
+                try:
+                    number = int(ask("路径序号", "1"))
+                    if not 1 <= number <= len(routes):
+                        raise ValueError()
+                    route = routes[number - 1]
+                except (TypeError, ValueError):
+                    raise Error("请选择有效路径序号。")
+                if action == "3":
+                    routes.remove(route)
+                    return True
+        path = prefix(ask("路径前缀，例如 /api", route["prefix"] if route else None))
+        target = self.backend(route["upstream"] if route else None, pending)
+        strip = yes("转发时去掉此前缀？", route.get("strip", True) if route else True)
+        auth = yes("此路径也要求网页登录密码？", route.get("auth", True) if route else True) if site.get("auth") else False
+        if any(r is not route and r["prefix"] == path for r in routes):
+            raise Error("此路径已存在，请选择修改，不要重复新增。")
+        updated = {"prefix": path, "upstream": target, "strip": strip, "auth": auth}
+        if route is None:
+            routes.append(updated)
+        else:
+            routes[routes.index(route)] = updated
+        return True
+
+    def route(self):
+        sites, site = self.choose_site()
+        if site is None:
+            return
+        pending = set()
+        if self.route_form(site, pending):
+            self.save_site(sites, site, pending, site["domain"])
+
+    def options(self, site, pending):
+        while True:
+            print("1 HTTPS/HTTP  2 后端协议  3 登录密码  4 IP 白名单\n5 上传限制  6 压缩  7 路径分流  0 完成")
+            selected = ask("只选择需要修改的项目", "0")
+            if selected == "0":
+                return
+            if selected == "1":
+                site["mode"] = "https" if yes("使用自动 HTTPS？", site["mode"] == "https") else "http"
+            elif selected == "2":
+                parsed = urllib.parse.urlsplit(site["upstream"])
+                scheme = ask("后端协议（http/https/h2c）", parsed.scheme)
+                site["upstream"] = upstream(urllib.parse.urlunsplit(parsed._replace(scheme=scheme)))
+            elif selected == "3":
+                if yes("启用网页登录密码？", bool(site.get("auth"))):
+                    old = site.get("auth") or {}
+                    site["auth"] = {"user": ask("访问用户名", old.get("user", "admin")), "hash": self.hash_password(old.get("hash"))}
+                    print("Basic Auth 占用 Authorization；使用 Bearer 的 API 路径应关闭额外网页登录认证。")
+                else:
+                    site.pop("auth", None)
+            elif selected == "4":
+                allow = ask("IP/CIDR，逗号分隔，- 清空；回车保留", ",".join(site.get("allow", []))) or ""
+                site["allow"] = [] if allow == "-" else [s.strip() for s in allow.split(",") if s.strip()]
+            elif selected == "5":
+                site["body_mb"] = int(ask("请求体上限 MiB，0 为不限", str(site.get("body_mb", 0))))
+            elif selected == "6":
+                site["compress"] = yes("启用压缩？", site.get("compress", True))
+            elif selected == "7":
+                self.route_form(site, pending)
+            else:
+                raise Error("无效选择。")
+
+    def edit(self):
+        sites, site = self.choose_site()
+        if site is None:
+            return
+        original = site["domain"]
+        pending = set()
+        print("1 修改后端  2 修改域名  3 路径分流  4 更多设置  0 取消")
+        selected = ask("修改哪一项", "0")
+        if selected == "0":
+            return
+        if selected == "1":
+            site["upstream"] = self.backend(site["upstream"], pending)
+        elif selected == "2":
+            site["domain"] = domain(ask("网站域名", original))
+        elif selected == "3":
+            if not self.route_form(site, pending):
+                return
+        elif selected == "4":
+            self.options(site, pending)
+        else:
+            raise Error("无效选择。")
+        self.save_site(sites, site, pending, original)
 
     def toggle(self, action):
         sites = self.sites()
@@ -580,7 +684,7 @@ class Manager:
         print("Caddy 已接入：" + ", ".join(obj["NetworkSettings"]["Networks"]))
         print("已有 Docker 网络：\n" + run(["docker", "network", "ls", "--format", "{{.Name}}\t{{.Driver}}"]))
 
-    def connect_network(self, name=None, approved=False):
+    def connect_network(self, name=None, approved=False, snapshot=None):
         if name is None:
             self.networks()
             name = ask("要接入的已有网络名（留空取消）")
@@ -603,7 +707,8 @@ class Manager:
         print("此网络内的容器将能与 Caddy 直接通信；之后请统一使用本工具管理入口。")
         if not approved and not yes("确认接入？"):
             return
-        self.backup()
+        if snapshot is None:
+            self.backup()
         old = (self.root / OVERLAY).read_bytes() if (self.root / OVERLAY).exists() else None
         connected = False
         try:
@@ -718,6 +823,7 @@ HELP = """Edge Proxy Kit — 轻量中文交互反向代理
   （无命令）           中文菜单；首次选择新装或接管
   install / adopt      新建入口 / 接管已有 Caddy Compose
   add / edit           交互新增 / 修改托管站点
+  route                单独新增、修改或移除路径分流
   list                 查看托管站点及原配置域名
   enable / disable     启用 / 停用站点
   remove               移除站点规则；保留证书及后端数据
@@ -794,10 +900,9 @@ def dispatch(manager, args):
     if action == "add":
         manager.add()
     elif action == "edit":
-        manager.list_sites()
-        selected = ask("编辑的托管站点域名（留空取消）")
-        if selected:
-            manager.add(domain(selected))
+        manager.edit()
+    elif action == "route":
+        manager.route()
     elif action in ("enable", "disable", "remove"):
         manager.toggle(action)
     elif action == "list":
@@ -883,9 +988,9 @@ def update_image(manager, image=None):
 
 
 def menu():
-    print("1 新增网站  2 管理网站  3 状态  4 日志\n5 更新  6 更多操作  0 退出")
+    print("1 新增网站  2 管理网站  3 状态  4 日志\n5 更新  6 更多操作  7 路径分流  0 退出")
     choice = ask("选择", "0")
-    direct = {"1": "add", "3": "status", "4": "logs", "5": "update"}
+    direct = {"1": "add", "3": "status", "4": "logs", "5": "update", "7": "route"}
     if choice == "0":
         return None
     if choice in direct:
