@@ -154,6 +154,36 @@ class EdgeTests(unittest.TestCase):
             self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
             self.assertEqual((directory / "Caddyfile").stat().st_mode & 0o777, 0o600)
 
+    def test_backup_retains_one_snapshot_in_deployment_and_removes_known_legacy_backups(self):
+        first = self.manager.backup()
+        legacy = self.root.parent / (self.root.name + "-backups")
+        legacy.mkdir()
+        shutil.copytree(first, legacy / first.name)
+        latest = self.manager.backup()
+        self.assertEqual(latest.parent, self.root / "backups")
+        self.assertFalse(first.exists())
+        self.assertFalse(legacy.exists())
+        self.assertEqual(list(latest.parent.iterdir()), [latest])
+
+    def test_failed_backup_preserves_last_completed_snapshot(self):
+        previous = self.manager.backup()
+        before = (previous / "manifest.json").read_bytes()
+        with mock.patch.object(edge, "private", side_effect=edge.Error("test disk failure")):
+            with self.assertRaises(edge.Error):
+                self.manager.backup()
+        self.assertEqual((previous / "manifest.json").read_bytes(), before)
+        self.assertEqual(list(previous.parent.iterdir()), [previous])
+
+    def test_backup_rotation_preserves_unknown_files_and_foreign_project(self):
+        first = self.manager.backup()
+        owner = edge.read_json(first / ".edge-kit/settings.json")
+        owner["project"] = "another-project"
+        edge.write_json(first / ".edge-kit/settings.json", owner)
+        edge.private(first.parent / "notes.txt", "keep")
+        self.manager.backup()
+        self.assertTrue(first.is_dir())
+        self.assertEqual((first.parent / "notes.txt").read_text(), "keep")
+
     def test_corrupt_backup_is_rejected_before_apply(self):
         directory = self.manager.backup()
         (directory / "Caddyfile").write_text("corrupted", encoding="utf-8")

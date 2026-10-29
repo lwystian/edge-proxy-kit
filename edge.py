@@ -364,25 +364,65 @@ class Manager:
         return read_json(path) if path.exists() else []
 
     def backup(self):
-        parent = self.root.parent / (self.root.name + "-backups")
+        parent = self.root / "backups"
         if parent.is_symlink():
             raise Error("备份目录不能是符号链接。")
         parent.mkdir(mode=0o700, exist_ok=True)
         os.chmod(parent, 0o700)
         directory = parent / ("edge-" + stamp())
         directory.mkdir(mode=0o700)
-        hashes = {}
-        for name in ("Caddyfile", "compose.yaml", OVERLAY, ".env", ".edge-kit/settings.json", CATALOG):
-            source = self.root / name
-            if source.is_symlink():
-                raise Error("备份拒绝符号链接。")
-            if source.is_file():
-                content = source.read_bytes()
-                private(directory / name, content)
-                hashes[name] = hashlib.sha256(content).hexdigest()
-        write_json(directory / "manifest.json", {"schema": 1, "files": hashes})
+        try:
+            hashes = {}
+            for name in ("Caddyfile", "compose.yaml", OVERLAY, ".env", ".edge-kit/settings.json", CATALOG):
+                source = self.root / name
+                if source.is_symlink():
+                    raise Error("备份拒绝符号链接。")
+                if source.is_file():
+                    content = source.read_bytes()
+                    private(directory / name, content)
+                    hashes[name] = hashlib.sha256(content).hexdigest()
+            write_json(directory / "manifest.json", {"schema": 1, "files": hashes})
+            for name, expected in hashes.items():
+                if hashlib.sha256((directory / name).read_bytes()).hexdigest() != expected:
+                    raise Error("新备份校验失败。")
+        except Exception:
+            if directory.resolve().parent != parent.resolve():
+                raise Error("备份临时目录越界。")
+            shutil.rmtree(directory)
+            raise
+        self.prune_backups(directory)
         print("配置备份：" + str(directory))
         return directory
+
+    def prune_backups(self, keep):
+        for parent in (self.root / "backups", self.root.parent / (self.root.name + "-backups")):
+            if parent.is_symlink() or not parent.is_dir():
+                continue
+            for directory in parent.iterdir():
+                if directory == keep or directory.is_symlink() or not directory.is_dir() or not re.fullmatch(r"edge-\d{8}T\d{12}Z", directory.name):
+                    continue
+                if directory.resolve().parent != parent.resolve():
+                    continue
+                try:
+                    entries = list(directory.rglob("*"))
+                    if any(p.is_symlink() or not (p.is_file() or p.is_dir()) for p in entries):
+                        continue
+                    owner = read_json(directory / ".edge-kit/settings.json")
+                    manifest = read_json(directory / "manifest.json")
+                    if owner != self.settings or manifest.get("schema") != 1:
+                        continue
+                    expected = manifest["files"]
+                    actual = {p.relative_to(directory).as_posix() for p in entries if p.is_file() and p.name != "manifest.json"}
+                    allowed = {"Caddyfile", "compose.yaml", OVERLAY, ".env", ".edge-kit/settings.json", CATALOG}
+                    if set(expected) != actual or not actual.issubset(allowed):
+                        continue
+                    if any(hashlib.sha256((directory / name).read_bytes()).hexdigest() != digest for name, digest in expected.items()):
+                        continue
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+                shutil.rmtree(directory)
+            if parent != self.root / "backups" and not any(parent.iterdir()):
+                parent.rmdir()
 
     def apply(self, sites, base=None, snapshot=None):
         old = self.current()
@@ -860,7 +900,7 @@ def sync_code():
     if not {"edge.py", "deploy.sh", "README.md"}.issubset(names):
         raise Error("远程代码缺少必要文件。")
     for name in names:
-        if name in ("Caddyfile", "compose.yaml", OVERLAY, "settings.json", ".env") or name.split("/")[0] in ("data", "config", ".edge-kit"):
+        if name in ("Caddyfile", "compose.yaml", OVERLAY, "settings.json", ".env") or name.split("/")[0] in ("data", "config", ".edge-kit", "backups"):
             raise Error("远程版本包含私有运行配置，拒绝自动更新。")
     compile(git("show", after + ":edge.py"), "edge.py", "exec")
     git("merge", "--ff-only", "--no-overwrite-ignore", after)

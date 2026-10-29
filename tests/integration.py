@@ -188,11 +188,15 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
                     pass
             assert (root / "Caddyfile").read_bytes() == old
             assert request("legacy.test")[1] == b"legacy-ok"
-            snapshot = manager.backup()
             manager.apply([changed])
+            snapshots = list((root / "backups").glob("edge-*"))
+            assert len(snapshots) == 1
+            snapshot = snapshots[0]
             with mock.patch.object(edge, "ask", return_value=str(snapshot)), mock.patch.object(edge, "yes", return_value=True):
                 edge.restore(manager)
             assert manager.sites()[0]["body_mb"] == 4
+            assert not snapshot.exists()
+            assert len(list((root / "backups").glob("edge-*"))) == 1
             print("PASS 配置备份及恢复、加载失败自动回退、原有网站保持可用")
             ca_before = (root / "data/caddy/pki/authorities/local/root.crt").read_bytes()
             with mock.patch.object(edge, "yes", return_value=True):
