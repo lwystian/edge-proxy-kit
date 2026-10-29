@@ -42,7 +42,7 @@ def main():
         app = project + "-app"
         fresh = Path(directory) / "fresh"
         fresh.mkdir()
-        with mock.patch.object(edge, "SOURCE", source), mock.patch.object(edge, "ask", return_value=project + "-fresh"), mock.patch.object(edge, "yes", side_effect=[True, False]):
+        with mock.patch.object(edge, "SOURCE", source), mock.patch.object(edge, "ask", return_value=project + "-fresh"), mock.patch.object(edge, "yes", return_value=False):
             try:
                 edge.setup(fresh)
                 new_manager = edge.Manager(fresh)
@@ -85,8 +85,12 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
             assert (root / "Caddyfile").read_text() == original
             candidates = manager.containers()
             choice = str(next(i for i, c in enumerate(candidates, 1) if c["Name"].lstrip("/") == app))
-            with mock.patch.object(edge, "ask", side_effect=["generic.test", "d", choice, "8000"]), mock.patch.object(edge, "yes", return_value=False):
-                manager.add()
+            with mock.patch.object(edge, "ask", side_effect=["generic.test", "d", KeyboardInterrupt]), mock.patch.object(edge, "yes", side_effect=AssertionError("unexpected confirmation")):
+                try:
+                    manager.add()
+                    raise AssertionError("interruption was ignored")
+                except KeyboardInterrupt:
+                    pass
             assert (root / "Caddyfile").read_text() == original
             assert network not in manager.container()["NetworkSettings"]["Networks"]
             assert not (root / edge.OVERLAY).exists()
@@ -98,12 +102,12 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
                     pass
             assert network not in manager.container()["NetworkSettings"]["Networks"]
             assert not (root / edge.OVERLAY).exists()
-            with mock.patch.object(edge, "ask", side_effect=["generic.test", "d", choice, "8000"]), mock.patch.object(edge, "yes", return_value=True):
+            with mock.patch.object(edge, "ask", side_effect=["generic.test", "d", choice, "8000"]), mock.patch.object(edge, "yes", side_effect=AssertionError("unexpected confirmation")):
                 manager.add()
             assert manager.container()["Id"] == original_container
             assert network in manager.container()["NetworkSettings"]["Networks"]
             assert manager.sites()[0]["upstream"] == "http://%s:8000" % app
-            print("PASS 通用精简向导选择真实容器与端口，确认后接入网络，取消无变更，失败回退网络；未重建入口及后端")
+            print("PASS 通用精简向导选择真实容器与端口，填完直接应用，输入中断无变更，失败回退网络；未重建入口及后端")
             password = "1"
             hashed = manager.exec("caddy", "hash-password", data=password + "\n").strip()
             value = {"domain": "app.test", "mode": "https", "upstream": "http://%s:8000" % app,

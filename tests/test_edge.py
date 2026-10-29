@@ -163,9 +163,10 @@ class EdgeTests(unittest.TestCase):
             apply.assert_not_called()
 
     def test_password_is_passed_by_stdin_and_not_command_arguments(self):
-        with mock.patch.object(edge.getpass, "getpass", side_effect=["1", "1"]), mock.patch.object(self.manager, "exec", return_value=HASH) as execute:
+        with mock.patch.object(edge.getpass, "getpass", return_value="1") as password, mock.patch.object(self.manager, "exec", return_value=HASH) as execute:
             self.assertEqual(self.manager.hash_password(), HASH)
             execute.assert_called_once_with("caddy", "hash-password", data="1\n")
+            password.assert_called_once()
 
     def test_blank_edit_password_keeps_hash_without_running_caddy(self):
         with mock.patch.object(edge.getpass, "getpass", return_value=""), mock.patch.object(self.manager, "exec") as execute:
@@ -198,25 +199,22 @@ class EdgeTests(unittest.TestCase):
             self.manager.backend(pending=pending)
         self.assertEqual(pending, set())
 
-    def test_manual_address_warns_about_loopback_mapping_without_assuming_remote_is_local(self):
-        with mock.patch.object(self.manager, "containers", return_value=[self.backend_container()]), \
-             mock.patch.object(edge, "ask", side_effect=["0", "http://198.51.100.10:9090"]), \
-             mock.patch.object(edge, "yes", return_value=True) as confirm, contextlib.redirect_stdout(io.StringIO()) as output:
+    def test_manual_address_does_not_trigger_extra_confirmation_or_container_scan(self):
+        with mock.patch.object(self.manager, "containers", side_effect=AssertionError("unnecessary scan")), mock.patch.object(edge, "ask", return_value="http://198.51.100.10:9090") as ask, mock.patch.object(edge, "yes", side_effect=AssertionError("unexpected confirmation")):
             self.assertEqual(self.manager.backend(), "http://198.51.100.10:9090")
-            confirm.assert_called_once()
-        self.assertIn("回环地址", output.getvalue())
+        self.assertEqual(ask.call_count, 1)
 
-    def test_simple_add_has_no_application_preset_or_raw_config_and_cancel_changes_nothing(self):
+    def test_simple_add_has_no_application_preset_or_extra_confirmation(self):
         before = (self.root / "Caddyfile").read_bytes()
         with mock.patch.object(edge, "ask", return_value="new.example.test") as ask, \
-             mock.patch.object(edge, "yes", return_value=False) as confirm, \
+             mock.patch.object(edge, "yes", side_effect=AssertionError("unexpected confirmation")) as confirm, \
              mock.patch.object(self.manager, "backend", return_value="http://app:8000"), \
              mock.patch.object(self.manager, "apply_with_networks") as apply, \
              contextlib.redirect_stdout(io.StringIO()) as output:
             self.manager.add()
             ask.assert_called_once_with("网站域名（默认 HTTPS）", None)
-            confirm.assert_called_once_with("确认备份并应用？", True)
-            apply.assert_not_called()
+            confirm.assert_not_called()
+            apply.assert_called_once()
         self.assertNotIn("MetaCubeXD", output.getvalue())
         self.assertNotIn("reverse_proxy", output.getvalue())
         self.assertEqual((self.root / "Caddyfile").read_bytes(), before)
@@ -265,13 +263,12 @@ class EdgeTests(unittest.TestCase):
         original["auth"]["user"] = "new-user"
         self.assertEqual(apply.call_args[0][0], [original])
 
-    def test_cancel_route_does_not_apply_or_replace_saved_catalog(self):
+    def test_interrupting_route_input_does_not_apply_or_replace_saved_catalog(self):
         edge.write_json(self.root / edge.CATALOG, [site()])
         before = (self.root / edge.CATALOG).read_bytes()
-        with mock.patch.object(edge, "ask", return_value="/api"), mock.patch.object(edge, "yes", side_effect=[True, False]), \
-             mock.patch.object(self.manager, "backend", return_value="http://api:8000"), \
-             mock.patch.object(self.manager, "apply_with_networks") as apply:
-            self.manager.route()
+        with mock.patch.object(edge, "ask", side_effect=KeyboardInterrupt), mock.patch.object(self.manager, "apply_with_networks") as apply:
+            with self.assertRaises(KeyboardInterrupt):
+                self.manager.route()
             apply.assert_not_called()
         self.assertEqual((self.root / edge.CATALOG).read_bytes(), before)
 
@@ -301,10 +298,10 @@ class EdgeTests(unittest.TestCase):
                 edge.site_address(value)
 
     def test_new_site_contains_only_generic_fields_and_two_inputs(self):
-        with mock.patch.object(edge, "ask", side_effect=["app.example.com", "198.51.100.10:8080"]) as ask, mock.patch.object(edge, "yes", return_value=True) as confirm, mock.patch.object(self.manager, "containers", return_value=[]), mock.patch.object(self.manager, "apply_with_networks") as apply:
+        with mock.patch.object(edge, "ask", side_effect=["app.example.com", "198.51.100.10:8080"]) as ask, mock.patch.object(edge, "yes", side_effect=AssertionError("unexpected confirmation")) as confirm, mock.patch.object(self.manager, "containers", return_value=[]), mock.patch.object(self.manager, "apply_with_networks") as apply:
             self.manager.add()
         self.assertEqual(ask.call_count, 2)
-        confirm.assert_called_once_with("确认备份并应用？", True)
+        confirm.assert_not_called()
         self.assertEqual(apply.call_args[0], ([{"domain": "app.example.com", "mode": "https", "enabled": True,
                                               "upstream": "http://198.51.100.10:8080", "routes": []}], set()))
 
@@ -345,7 +342,7 @@ class EdgeTests(unittest.TestCase):
     def test_uninstall_only_removes_own_service_and_keeps_data(self):
         (self.root / "data").mkdir()
         edge.private(self.root / "data/cert-marker", "keep")
-        with mock.patch.object(edge, "yes", return_value=True), mock.patch.object(self.manager, "container"), mock.patch.object(self.manager, "compose") as compose:
+        with mock.patch.object(edge, "yes", side_effect=AssertionError("unexpected confirmation")), mock.patch.object(self.manager, "container"), mock.patch.object(self.manager, "compose") as compose:
             edge.dispatch(self.manager, type("Args", (), {"command": "uninstall"})())
         self.assertEqual(compose.call_args_list, [mock.call("stop", "caddy"), mock.call("rm", "-f", "caddy")])
         self.assertEqual((self.root / "data/cert-marker").read_text(), "keep")

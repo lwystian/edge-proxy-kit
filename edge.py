@@ -427,10 +427,8 @@ class Manager:
                 break
             if "\0" in first or "\n" in first or "\r" in first or len(first.encode()) > 72:
                 print("bcrypt 密码须为 1–72 UTF-8 字节，不能含换行或 NUL；不限制复杂度。")
-            elif first == getpass.getpass("再次输入访问密码："):
-                break
             else:
-                print("两次输入不同，请重试。")
+                break
         hashed = self.exec("caddy", "hash-password", data=first + "\n").strip()
         return hashed
 
@@ -464,15 +462,6 @@ class Manager:
                 raise Error("请选择列表中的容器序号。")
         else:
             address = upstream(ask("后端地址", default) if selected == "0" else selected)
-            parsed = urllib.parse.urlsplit(address)
-            number = parsed.port or (443 if parsed.scheme == "https" else 80)
-            loopback = any(b.get("HostIp") in ("127.0.0.1", "::1") and int(b.get("HostPort", 0)) == number
-                           for c in self.containers() for bindings in (c.get("NetworkSettings", {}).get("Ports", {}) or {}).values()
-                           for b in bindings or [])
-            if loopback:
-                print("本机 Docker 的端口 %s 存在仅绑定回环地址的映射；若填的是本机公网 IP，不能通过它访问该服务，建议直接选择容器。" % number)
-                if not yes("仍使用此手动地址？"):
-                    return self.backend(default, pending)
             return address
         try:
             index = int(selected)
@@ -518,7 +507,7 @@ class Manager:
         snapshot = self.backup()
         try:
             for network in sorted(pending):
-                self.connect_network(network, approved=True, snapshot=snapshot)
+                self.connect_network(network, snapshot=snapshot)
             self.apply(sites, snapshot=snapshot)
         except Exception:
             if old is None:
@@ -555,8 +544,7 @@ class Manager:
                 print("%s → %s（%s前缀）" % (route["prefix"], route["upstream"], "去掉" if route.get("strip", True) else "保留"))
         if pending:
             print("入口将接入网络：%s（保留原网络，不重启后端）" % ", ".join(sorted(pending)))
-        if yes("确认备份并应用？", True):
-            self.apply_with_networks([s for s in sites if s["domain"] != editing] + [site], pending)
+        self.apply_with_networks([s for s in sites if s["domain"] != editing] + [site], pending)
 
     def choose_site(self):
         sites = self.sites()
@@ -659,8 +647,6 @@ class Manager:
         site = next((s for s in sites if s["domain"] == name), None)
         if site is None:
             raise Error("此站点不在托管列表中。")
-        if not yes("确认%s %s？证书与后端数据均保留" % (action, name)):
-            return
         if action == "remove":
             sites.remove(site)
         else:
@@ -678,7 +664,7 @@ class Manager:
         print("Caddy 已接入：" + ", ".join(obj["NetworkSettings"]["Networks"]))
         print("已有 Docker 网络：\n" + run(["docker", "network", "ls", "--format", "{{.Name}}\t{{.Driver}}"]))
 
-    def connect_network(self, name=None, approved=False, snapshot=None):
+    def connect_network(self, name=None, snapshot=None):
         if name is None:
             self.networks()
             name = ask("要接入的已有网络名（留空取消）")
@@ -699,8 +685,6 @@ class Manager:
         overlay.setdefault("networks", {})[key] = {"external": True, "name": name}
         print("仅将 Caddy 接入 %s，并写入 %s 持久化。不会修改或重启后端容器。" % (name, OVERLAY))
         print("此网络内的容器将能与 Caddy 直接通信；之后请统一使用本工具管理入口。")
-        if not approved and not yes("确认接入？"):
-            return
         if snapshot is None:
             self.backup()
         old = (self.root / OVERLAY).read_bytes() if (self.root / OVERLAY).exists() else None
@@ -769,8 +753,6 @@ def setup(root, adopt=False):
         if BEGIN in manager.current() or (root / OVERLAY).exists():
             raise Error("已有托管标记或同名覆盖配置，拒绝覆盖。")
         print("仅建立管理记录，原 Caddyfile、Compose、证书和容器保持原样。")
-        if not yes("确认接管现有 Caddy？"):
-            return
     else:
         if any((root / name).exists() for name in ("Caddyfile", "compose.yaml", OVERLAY, "data", "config")):
             raise Error("目录已有运行配置或数据，请选择 adopt 接管，不能按新安装覆盖。")
@@ -786,8 +768,6 @@ def setup(root, adopt=False):
             except OSError:
                 raise Error("宿主机端口 %s 已占用，不能安装另一个入口；现有 Caddy 可选择 adopt。" % port)
         print("将新建一个官方 Caddy 容器，发布 TCP 80/443，证书保存在项目 data/；不修改防火墙或 DNS。")
-        if not yes("确认安装？", True):
-            return
         for directory in ("data", "config"):
             (root / directory).mkdir(mode=0o700)
         private(root / "Caddyfile", "# 由 Edge Proxy Kit 管理；使用 ./deploy.sh 添加站点\n")
@@ -852,12 +832,11 @@ def restore(manager):
     if old_settings != manager.settings:
         raise Error("备份不属于当前项目，拒绝恢复。")
     print("仅恢复网站规则和站点记录；不覆盖 Compose、网络、证书或业务数据。")
-    if yes("确认先备份当前配置，再恢复？"):
-        base, block = split_config((directory / "Caddyfile").read_text(encoding="utf-8"))
-        sites = read_json(directory / CATALOG)
-        if block != managed(sites):
-            raise Error("备份的托管区域与记录不一致。")
-        manager.apply(sites, base=base)
+    base, block = split_config((directory / "Caddyfile").read_text(encoding="utf-8"))
+    sites = read_json(directory / CATALOG)
+    if block != managed(sites):
+        raise Error("备份的托管区域与记录不一致。")
+    manager.apply(sites, base=base)
 
 
 def sync_code():
@@ -920,15 +899,12 @@ def dispatch(manager, args):
         manager.adapt(manager.current())
         manager.exec("caddy", "reload", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile")
     elif action == "logs":
-        print("日志可能包含域名和请求信息；请勿分享未经检查的原始日志。")
         values = manager.command("logs", "--tail", "100") + (["-f"] if args.follow else []) + [manager.settings["service"]]
         subprocess.run(values, check=True)
     elif action in ("start", "stop", "restart", "update", "uninstall"):
         service = manager.settings["service"]
         if action in ("stop", "restart", "uninstall"):
             manager.container()
-        if action in ("stop", "restart", "uninstall") and not yes("%s 将中断本入口的所有站点，确认继续？" % action):
-            return
         if action == "uninstall":
             manager.backup()
             manager.compose("stop", service)
@@ -959,9 +935,7 @@ def update_image(manager, image=None):
     service = manager.settings["service"]
     if image and not re.fullmatch(r"(?:docker.io/library/)?caddy:\d+\.\d+\.\d+-alpine(?:@sha256:[a-f0-9]{64})?", image):
         raise Error("请使用官方 Caddy 明确版本，例如 caddy:2.11.4-alpine，可附 sha256。")
-    print("入口镜像更新可能短暂中断所有站点，其他业务容器不会重启。")
-    if not yes("确认先备份配置再更新镜像？", True):
-        return
+    print("更新入口镜像，先备份配置。")
     manager.backup()
     try:
         if image:
