@@ -618,6 +618,9 @@ def setup(root, adopt=False):
         manager.doctor()
     write_json(SOURCE / "settings.json", {"root": str(root)})
     print("管理已就绪，执行 ./deploy.sh add 添加网站，或直接执行 ./deploy.sh 打开菜单。")
+    if not adopt and yes("现在新增第一个网站？", True):
+        with lock(root):
+            manager.add()
 
 
 HELP = """Edge Proxy Kit — 轻量中文交互反向代理
@@ -832,14 +835,20 @@ def main():
         return
     manager = Manager(root)
     if args.command is None:
-        print("1 新增网站  2 修改网站  3 网站列表  4 停用网站  5 启用网站\n6 接入 Docker 网络  7 诊断  8 状态  9 备份  10 恢复  0 退出")
+        print("1 新增网站  2 修改网站  3 网站列表  4 停用网站  5 启用网站\n6 接入 Docker 网络  7 诊断  8 状态  9 备份  10 恢复\n11 移除网站  12 启动  13 停止  14 重启  15 更新  16 日志\n17 网络列表  18 平滑加载  19 卸载入口  20 帮助  0 退出")
         selected = ask("选择操作", "0")
-        actions = {"1": "add", "2": "edit", "3": "list", "4": "disable", "5": "enable", "6": "connect-network", "7": "doctor", "8": "status", "9": "backup", "10": "restore"}
+        actions = {"1": "add", "2": "edit", "3": "list", "4": "disable", "5": "enable", "6": "connect-network", "7": "doctor", "8": "status", "9": "backup", "10": "restore", "11": "remove", "12": "start", "13": "stop", "14": "restart", "15": "update", "16": "logs", "17": "networks", "18": "reload", "19": "uninstall", "20": "help"}
         if selected == "0":
             return
         args.command = actions.get(selected)
         if args.command is None:
             raise Error("无效选择。")
+        if args.command == "help":
+            print(HELP)
+            return
+        if args.command == "update" and not args.image_only:
+            sys.stdout.flush()
+            os.execv(sys.executable, [sys.executable, str(SOURCE / "edge.py"), "update", "--root", str(root)])
     with lock(root):
         dispatch(manager, args)
 

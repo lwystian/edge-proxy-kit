@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -163,6 +164,19 @@ class EdgeTests(unittest.TestCase):
             self.assertEqual(self.manager.hash_password(), HASH)
             execute.assert_called_once_with("caddy", "hash-password", data="1\n")
 
+    def test_blank_edit_password_keeps_hash_without_running_caddy(self):
+        with mock.patch.object(edge.getpass, "getpass", return_value=""), mock.patch.object(self.manager, "exec") as execute:
+            self.assertEqual(self.manager.hash_password(HASH), HASH)
+            execute.assert_not_called()
+
+    def test_fresh_install_refuses_an_existing_compose_project(self):
+        destination = self.root.parent / "fresh"
+        destination.mkdir()
+        with mock.patch.object(edge, "ask", return_value="edge-test"), mock.patch.object(edge, "run", return_value="existing-container"):
+            with self.assertRaisesRegex(edge.Error, "同名 Compose"):
+                edge.setup(destination)
+        self.assertEqual(list(destination.iterdir()), [])
+
     def test_help_has_no_docker_or_privilege_requirements(self):
         with mock.patch.object(sys, "argv", ["deploy.sh", "help"]), mock.patch.object(edge, "run") as execute, contextlib.redirect_stdout(io.StringIO()) as output:
             edge.main()
@@ -193,6 +207,79 @@ class EdgeTests(unittest.TestCase):
         edge.private(self.root / "edge.py", "import sys; print(repr(sys.argv[1:]))\n")
         result = subprocess.run([str(entry), "help"], capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.strip(), "['help']")
+
+
+@unittest.skipUnless(shutil.which("git"), "自动更新测试需要 Git")
+class GitUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.seed, self.remote, self.root = base / "seed", base / "remote.git", base / "project"
+        self.seed.mkdir()
+        self.git(self.seed, "init", "-b", "main")
+        self.git(self.seed, "config", "user.name", "Edge Test")
+        self.git(self.seed, "config", "user.email", "test@example.invalid")
+        for name in ("edge.py", "deploy.sh", "README.md", ".gitignore", ".gitattributes"):
+            shutil.copy2(ROOT / name, self.seed / name)
+        self.commit("initial")
+        self.git(self.seed, "clone", "--bare", str(self.seed), str(self.remote))
+        self.git(self.seed, "remote", "add", "origin", str(self.remote))
+        self.git(self.seed, "push", "-u", "origin", "main")
+        self.git(self.seed, "clone", "-b", "main", str(self.remote), str(self.root))
+
+    def git(self, directory, *args):
+        return edge.run(["git", "-c", "core.fsmonitor=false", "-c", "safe.directory=" + directory.as_posix()] + list(args), cwd=directory)
+
+    def commit(self, message):
+        self.git(self.seed, "add", "-A")
+        self.git(self.seed, "commit", "-m", message)
+
+    def publish(self):
+        (self.seed / "README.md").write_text("new docs\n", encoding="utf-8")
+        self.commit("remote change")
+        self.git(self.seed, "push")
+
+    def test_code_fast_forward_preserves_private_files(self):
+        edge.private(self.root / "Caddyfile", "private site")
+        edge.private(self.root / "data/cert-marker", "private cert")
+        self.publish()
+        with mock.patch.object(edge, "SOURCE", self.root):
+            self.assertTrue(edge.sync_code())
+        self.assertEqual((self.root / "README.md").read_text(), "new docs\n")
+        self.assertEqual((self.root / "Caddyfile").read_text(), "private site")
+        self.assertEqual((self.root / "data/cert-marker").read_text(), "private cert")
+
+    def test_unchanged_code_is_not_reexecuted(self):
+        with mock.patch.object(edge, "SOURCE", self.root):
+            self.assertFalse(edge.sync_code())
+
+    def test_dirty_code_is_not_overwritten(self):
+        self.publish()
+        (self.root / "README.md").write_text("my local changes", encoding="utf-8")
+        with mock.patch.object(edge, "SOURCE", self.root), self.assertRaisesRegex(edge.Error, "本地修改"):
+            edge.sync_code()
+        self.assertEqual((self.root / "README.md").read_text(), "my local changes")
+
+    def test_remote_private_path_is_rejected(self):
+        (self.seed / "Caddyfile").write_text("bad runtime config", encoding="utf-8")
+        self.git(self.seed, "add", "-f", "Caddyfile")
+        self.git(self.seed, "commit", "-m", "unsafe runtime config")
+        self.git(self.seed, "push")
+        edge.private(self.root / "Caddyfile", "keep me")
+        with mock.patch.object(edge, "SOURCE", self.root), self.assertRaisesRegex(edge.Error, "私有运行配置"):
+            edge.sync_code()
+        self.assertEqual((self.root / "Caddyfile").read_text(), "keep me")
+
+    def test_ignored_file_collision_is_not_overwritten(self):
+        (self.seed / "private.log").write_text("remote file", encoding="utf-8")
+        self.git(self.seed, "add", "-f", "private.log")
+        self.git(self.seed, "commit", "-m", "ignored filename collision")
+        self.git(self.seed, "push")
+        edge.private(self.root / "private.log", "private local file")
+        with mock.patch.object(edge, "SOURCE", self.root), self.assertRaises(edge.Error):
+            edge.sync_code()
+        self.assertEqual((self.root / "private.log").read_text(), "private local file")
 
 
 if __name__ == "__main__":

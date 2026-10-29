@@ -40,6 +40,18 @@ def main():
         project = "edge-ci-" + uuid.uuid4().hex[:10]
         network = project + "-backend"
         app = project + "-app"
+        fresh = Path(directory) / "fresh"
+        fresh.mkdir()
+        with mock.patch.object(edge, "SOURCE", source), mock.patch.object(edge, "ask", return_value=project + "-fresh"), mock.patch.object(edge, "yes", side_effect=[True, False]):
+            try:
+                edge.setup(fresh)
+                new_manager = edge.Manager(fresh)
+                assert new_manager.container()["State"]["Running"]
+                assert (fresh / "data").is_dir() and (fresh / "config").is_dir()
+                new_manager.compose("down")
+                print("PASS 全新入口实际安装、标准 80/443 发布、数据目录及健康检查")
+            finally:
+                edge.run(["docker", "compose", "--project-directory", fresh, "-p", project + "-fresh", "-f", fresh / "compose.yaml", "down"])
         http_port, https_port = free_port(), free_port()
         fixture = '''from http.server import BaseHTTPRequestHandler,HTTPServer
 import json,base64,hashlib
