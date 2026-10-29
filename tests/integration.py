@@ -83,11 +83,27 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
             manager = edge.Manager(root)
             original_container = manager.container()["Id"]
             assert (root / "Caddyfile").read_text() == original
-            with mock.patch.object(edge, "ask", return_value=network), mock.patch.object(edge, "yes", return_value=True):
-                manager.connect_network()
+            candidates = manager.containers()
+            choice = str(next(i for i, c in enumerate(candidates, 1) if c["Name"].lstrip("/") == app))
+            with mock.patch.object(edge, "ask", side_effect=["generic.test", choice, "8000"]), mock.patch.object(edge, "yes", side_effect=[False, False]):
+                manager.add()
+            assert (root / "Caddyfile").read_text() == original
+            assert network not in manager.container()["NetworkSettings"]["Networks"]
+            assert not (root / edge.OVERLAY).exists()
+            with mock.patch.object(manager, "apply", side_effect=edge.Error("test site validation failure")):
+                try:
+                    manager.apply_with_networks([], {network})
+                    raise AssertionError("failure was ignored")
+                except edge.Error:
+                    pass
+            assert network not in manager.container()["NetworkSettings"]["Networks"]
+            assert not (root / edge.OVERLAY).exists()
+            with mock.patch.object(edge, "ask", side_effect=["generic.test", choice, "8000"]), mock.patch.object(edge, "yes", side_effect=[False, True]):
+                manager.add()
             assert manager.container()["Id"] == original_container
             assert network in manager.container()["NetworkSettings"]["Networks"]
-            print("PASS 无改动接管，Caddy 网络持久化；未重建入口及后端容器")
+            assert manager.sites()[0]["upstream"] == "http://%s:8000" % app
+            print("PASS 通用精简向导选择真实容器与端口，确认后接入网络，取消无变更，失败回退网络；未重建入口及后端")
             password = "1"
             hashed = manager.exec("caddy", "hash-password", data=password + "\n").strip()
             value = {"domain": "panel.test", "mode": "https", "upstream": "http://%s:8000" % app,

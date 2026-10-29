@@ -193,7 +193,7 @@ def validate_site(site):
         seen.add(path)
         upstream(route.get("upstream"))
         if site.get("mihomo") and (path == "/api" or path.startswith("/api/control")):
-            raise Error("MetaCubeXD 模式的 /api/control 为保留控制接口，不能另加分流规则。")
+            raise Error("旧版兼容规则已占用此控制接口路径，不能重复添加分流。")
     for cidr in site.get("allow", []):
         try:
             ipaddress.ip_network(cidr, strict=False)
@@ -275,6 +275,16 @@ def hosts(config):
                 walk(value)
     walk(config)
     return result
+
+
+def container_ports(container):
+    """发布端口优先，其余只是镜像声明，均不能当作监听成功的证明。"""
+    bindings = container.get("NetworkSettings", {}).get("Ports", {}) or {}
+    exposed = container.get("Config", {}).get("ExposedPorts", {}) or {}
+    def tcp(names):
+        return {int(name.split("/")[0]) for name in names if re.fullmatch(r"[0-9]+/tcp", name)}
+    published = tcp(name for name, values in bindings.items() if values)
+    return sorted(published) + sorted((tcp(bindings) | tcp(exposed)) - published)
 
 
 class Manager:
@@ -409,59 +419,138 @@ class Manager:
         hashed = self.exec("caddy", "hash-password", data=first + "\n").strip()
         return hashed
 
-    def backend(self, default=None):
-        print("后端示例：http://app-web:8000；使用容器内部端口，不能填写 Caddy 的 127.0.0.1。")
-        return upstream(ask("后端地址", default))
+    def containers(self):
+        proxy = self.container()["Id"]
+        ids = run(["docker", "ps", "-q"]).split()
+        values = json.loads(run(["docker", "inspect"] + ids)) if ids else []
+        return sorted((c for c in values if c["Id"] != proxy and c.get("State", {}).get("Running")),
+                      key=lambda c: c["Name"])
+
+    def list_containers(self, values=None):
+        values = self.containers() if values is None else values
+        print("选择提供网页/API 的容器；端口来自发布/声明信息，不保证正在监听。")
+        for index, container in enumerate(values, 1):
+            ports = ", ".join(str(p) for p in container_ports(container)) or "未声明，可手输"
+            print("%s. %s  端口：%s" % (index, container["Name"].lstrip("/"), ports))
+        return values
+
+    def backend(self, default=None, pending=None):
+        pending = pending if pending is not None else set()
+        values = self.list_containers()
+        print("0. 手动填写地址" + ("；直接回车保留当前后端" if default else ""))
+        selected = ask("选择后端容器序号", "" if default else ("1" if len(values) == 1 else None))
+        if not selected and default:
+            return default
+        if selected in ("0", None, ""):
+            address = upstream(ask("后端地址，例如 http://服务地址:端口", default))
+            parsed = urllib.parse.urlsplit(address)
+            number = parsed.port or (443 if parsed.scheme == "https" else 80)
+            loopback = any(b.get("HostIp") in ("127.0.0.1", "::1") and int(b.get("HostPort", 0)) == number
+                           for c in values for bindings in (c.get("NetworkSettings", {}).get("Ports", {}) or {}).values()
+                           for b in bindings or [])
+            if loopback:
+                print("本机 Docker 的端口 %s 存在仅绑定回环地址的映射；若填的是本机公网 IP，不能通过它访问该服务，建议直接选择容器。" % number)
+                if not yes("仍使用此手动地址？"):
+                    return self.backend(default, pending)
+            return address
+        try:
+            index = int(selected)
+            if not 1 <= index <= len(values):
+                raise ValueError()
+            container = values[index - 1]
+        except ValueError:
+            raise Error("请选择列表中的容器序号。")
+        ports = container_ports(container)
+        try:
+            port = int(ask("容器内实际服务端口", str(ports[0]) if ports else None))
+            if not 1 <= port <= 65535:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise Error("服务端口范围为 1–65535。")
+        networks = set(container.get("NetworkSettings", {}).get("Networks", {})) - {"bridge", "host", "none"}
+        connected = set(self.container()["NetworkSettings"]["Networks"]) | pending
+        if not networks.intersection(connected):
+            if not networks:
+                raise Error("此容器没有可用的自定义网络，请先为后端配置网络，或使用手动可达地址。")
+            names = sorted(networks)
+            if len(names) == 1:
+                network = names[0]
+            else:
+                print("后端所在网络：" + ", ".join("%s=%s" % (i, n) for i, n in enumerate(names, 1)))
+                try:
+                    choice = int(ask("选择接入网络序号", "1"))
+                    if not 1 <= choice <= len(names):
+                        raise ValueError()
+                    network = names[choice - 1]
+                except ValueError:
+                    raise Error("无效网络序号。")
+            pending.add(network)
+        return upstream("http://%s:%s" % (container["Name"].lstrip("/"), port))
+
+    def apply_with_networks(self, sites, pending):
+        if not pending:
+            return self.apply(sites)
+        obj = self.container()
+        before_networks = set(obj["NetworkSettings"]["Networks"])
+        overlay = self.root / OVERLAY
+        old = overlay.read_bytes() if overlay.exists() else None
+        self.backup()
+        try:
+            for network in sorted(pending):
+                self.connect_network(network, approved=True)
+            self.apply(sites)
+        except Exception:
+            if old is None:
+                overlay.unlink(missing_ok=True)
+            else:
+                private(overlay, old)
+            current = set(self.container()["NetworkSettings"]["Networks"])
+            for network in sorted((current - before_networks).intersection(pending)):
+                run(["docker", "network", "disconnect", network, obj["Id"]])
+            raise
 
     def add(self, editing=None):
         sites = self.sites()
         previous = next((s for s in sites if s["domain"] == editing), None)
         if editing and previous is None:
             raise Error("只能交互编辑本工具创建的站点；原有手写站点保持原样。")
-        print("普通反代选 1；MetaCubeXD 面板与 API 同域分流选 2。WebSocket 自动支持。")
-        preset = ask("站点类型（1=普通，2=MetaCubeXD）", "2" if previous and previous.get("mihomo") else "1")
-        if preset not in ("1", "2"):
-            raise Error("请选择 1 或 2。")
+        pending = set()
         site = copy.deepcopy(previous) if previous else {"enabled": True, "compress": True, "allow": [], "body_mb": 0}
         site["domain"] = domain(ask("网站域名", editing))
-        site["mode"] = "https" if yes("启用自动 HTTPS（域名须解析且公网 80/443 可达）？", site.get("mode", "https") == "https") else "http"
-        print("请先使用 networks / connect-network，让 Caddy 加入后端所在的可信 Docker 网络。")
-        site["upstream"] = self.backend(site.get("upstream"))
-        if site.get("mihomo", False) != (preset == "2"):
-            site["routes"] = []
-        site["mihomo"] = preset == "2"
+        site.setdefault("mode", "https")
+        site["upstream"] = self.backend(site.get("upstream"), pending)
         site.setdefault("routes", [])
-        if site["mihomo"]:
-            old_api = next((r["upstream"] for r in site["routes"] if r["prefix"] == "/mihomo"), None)
-            panel_host = urllib.parse.urlsplit(site["upstream"]).hostname
-            api = upstream(ask("Mihomo API 地址", old_api or "http://%s:9091" % ("[" + panel_host + "]" if ":" in panel_host else panel_host)))
-            site["routes"] = [r for r in site["routes"] if r["prefix"] != "/mihomo"] + [{"prefix": "/mihomo", "upstream": api, "strip": True, "auth": False}]
-            print("/mihomo/ 转发内核 API；/api/control/ 使用 CONTROL_TOKEN。两个 API 均依赖原有 Bearer 密钥，不叠加 Basic Auth。")
-            print("面板后端地址填写 https://你的域名/mihomo（HTTP 模式改用 http）。")
-        if yes("启用网页登录密码？", bool(site.get("auth"))):
-            site["auth"] = {"user": ask("访问用户名", (site.get("auth") or {}).get("user", "admin")), "hash": self.hash_password((site.get("auth") or {}).get("hash"))}
-            if not site["mihomo"]:
+        if yes("高级设置（HTTP、访问密码、路径分流等）？"):
+            site["mode"] = "https" if yes("使用自动 HTTPS？", site["mode"] == "https") else "http"
+            parsed = urllib.parse.urlsplit(site["upstream"])
+            scheme = ask("后端协议（http/https/h2c）", parsed.scheme)
+            site["upstream"] = upstream(urllib.parse.urlunsplit(parsed._replace(scheme=scheme)))
+            if yes("启用网页登录密码？", bool(site.get("auth"))):
+                site["auth"] = {"user": ask("访问用户名", (site.get("auth") or {}).get("user", "admin")), "hash": self.hash_password((site.get("auth") or {}).get("hash"))}
                 print("Basic Auth 占用 Authorization；后端若也用 Bearer，请为 API 配置独立且免 Basic 的路径。")
-        else:
-            site.pop("auth", None)
-        if yes("修改高级选项（路径分流、IP 白名单、压缩、上传限制）？"):
+            else:
+                site.pop("auth", None)
             allow = ask("允许的 IP/CIDR，逗号分隔，- 清空；回车保留", ",".join(site.get("allow", []))) or ""
             site["allow"] = ("" if allow == "-" else allow).replace(" ", "").split(",")
             site["allow"] = [x for x in site["allow"] if x]
             site["compress"] = yes("启用压缩？", site.get("compress", True))
             site["body_mb"] = int(ask("请求体上限 MiB，0 为不额外限制", str(site.get("body_mb", 0))))
-            if site["routes"] and yes("重新配置已有路径分流？（保留 MetaCubeXD 必需的 /mihomo 路由）"):
-                site["routes"] = [r for r in site["routes"] if site["mihomo"] and r["prefix"] == "/mihomo"]
+            if site["routes"] and not site.get("mihomo") and yes("清空已有路径分流，重新配置？"):
+                site["routes"] = []
             while yes("增加一个路径分流？"):
                 path = prefix(ask("路径前缀，例如 /api"))
-                site["routes"].append({"prefix": path, "upstream": self.backend(), "strip": yes("转发时去掉此前缀？", True),
+                site["routes"].append({"prefix": path, "upstream": self.backend(pending=pending), "strip": yes("转发时去掉此前缀？", True),
                                        "auth": yes("此路径也要求网页登录密码？", True) if site.get("auth") else False})
         validate_site(site)
         if any(s["domain"] == site["domain"] and s["domain"] != editing for s in sites):
             raise Error("此域名已存在。")
-        print("\n待应用配置（密码哈希已隐藏）：\n" + re.sub(r"\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}", "<密码哈希>", render_site(site)))
-        if yes("确认备份并应用以上配置？", True):
-            self.apply([s for s in sites if s["domain"] != editing] + [site])
+        print("\n网站：%s://%s\n后端：%s\n访问密码：%s" % (site["mode"], site["domain"], site["upstream"], "已启用" if site.get("auth") else "未启用"))
+        if site["routes"]:
+            print("路径分流：" + ", ".join(r["prefix"] for r in site["routes"]))
+        if pending:
+            print("入口将接入网络：%s（保留原网络，不重启后端）" % ", ".join(sorted(pending)))
+        if yes("确认备份并应用？", True):
+            self.apply_with_networks([s for s in sites if s["domain"] != editing] + [site], pending)
 
     def toggle(self, action):
         sites = self.sites()
@@ -491,9 +580,10 @@ class Manager:
         print("Caddy 已接入：" + ", ".join(obj["NetworkSettings"]["Networks"]))
         print("已有 Docker 网络：\n" + run(["docker", "network", "ls", "--format", "{{.Name}}\t{{.Driver}}"]))
 
-    def connect_network(self):
-        self.networks()
-        name = ask("要接入的已有网络名（留空取消）")
+    def connect_network(self, name=None, approved=False):
+        if name is None:
+            self.networks()
+            name = ask("要接入的已有网络名（留空取消）")
         if not name:
             return
         info = json.loads(run(["docker", "network", "inspect", name]))[0]
@@ -511,7 +601,7 @@ class Manager:
         overlay.setdefault("networks", {})[key] = {"external": True, "name": name}
         print("仅将 Caddy 接入 %s，并写入 %s 持久化。不会修改或重启后端容器。" % (name, OVERLAY))
         print("此网络内的容器将能与 Caddy 直接通信；之后请统一使用本工具管理入口。")
-        if not yes("确认接入？"):
+        if not approved and not yes("确认接入？"):
             return
         self.backup()
         old = (self.root / OVERLAY).read_bytes() if (self.root / OVERLAY).exists() else None
@@ -632,6 +722,7 @@ HELP = """Edge Proxy Kit — 轻量中文交互反向代理
   enable / disable     启用 / 停用站点
   remove               移除站点规则；保留证书及后端数据
   networks             列出现有 Docker 网络
+  containers           查看可选后端容器及声明/发布端口
   connect-network      交互接入已有网络并持久化
   status / doctor      状态 / 配置及 DNS 诊断
   logs [-f]            本机查看入口原始日志，分享前须检查敏感内容
@@ -713,6 +804,8 @@ def dispatch(manager, args):
         manager.list_sites()
     elif action == "networks":
         manager.networks()
+    elif action == "containers":
+        manager.list_containers()
     elif action == "connect-network":
         manager.connect_network()
     elif action == "doctor":
@@ -789,6 +882,30 @@ def update_image(manager, image=None):
     print("入口镜像及配置检查完成。证书、后端应用及业务数据保留。")
 
 
+def menu():
+    print("1 新增网站  2 管理网站  3 状态  4 日志\n5 更新  6 更多操作  0 退出")
+    choice = ask("选择", "0")
+    direct = {"1": "add", "3": "status", "4": "logs", "5": "update"}
+    if choice == "0":
+        return None
+    if choice in direct:
+        return direct[choice]
+    if choice == "2":
+        print("1 网站列表  2 修改  3 启用  4 停用  5 移除  0 退出")
+        actions = {"1": "list", "2": "edit", "3": "enable", "4": "disable", "5": "remove"}
+    elif choice == "6":
+        print("1 诊断  2 后端容器  3 网络列表  4 接入网络\n5 备份  6 恢复  7 启动  8 停止  9 重启\n10 平滑加载  11 卸载入口  12 帮助  0 退出")
+        actions = {"1": "doctor", "2": "containers", "3": "networks", "4": "connect-network", "5": "backup", "6": "restore", "7": "start", "8": "stop", "9": "restart", "10": "reload", "11": "uninstall", "12": "help"}
+    else:
+        raise Error("无效选择。")
+    choice = ask("选择", "0")
+    if choice == "0":
+        return None
+    if choice not in actions:
+        raise Error("无效选择。")
+    return actions[choice]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Edge Proxy Kit 中文交互反向代理")
     parser.add_argument("command", nargs="?", default=None)
@@ -835,14 +952,9 @@ def main():
         return
     manager = Manager(root)
     if args.command is None:
-        print("1 新增网站  2 修改网站  3 网站列表  4 停用网站  5 启用网站\n6 接入 Docker 网络  7 诊断  8 状态  9 备份  10 恢复\n11 移除网站  12 启动  13 停止  14 重启  15 更新  16 日志\n17 网络列表  18 平滑加载  19 卸载入口  20 帮助  0 退出")
-        selected = ask("选择操作", "0")
-        actions = {"1": "add", "2": "edit", "3": "list", "4": "disable", "5": "enable", "6": "connect-network", "7": "doctor", "8": "status", "9": "backup", "10": "restore", "11": "remove", "12": "start", "13": "stop", "14": "restart", "15": "update", "16": "logs", "17": "networks", "18": "reload", "19": "uninstall", "20": "help"}
-        if selected == "0":
-            return
-        args.command = actions.get(selected)
+        args.command = menu()
         if args.command is None:
-            raise Error("无效选择。")
+            return
         if args.command == "help":
             print(HELP)
             return

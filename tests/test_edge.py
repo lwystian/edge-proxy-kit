@@ -169,6 +169,73 @@ class EdgeTests(unittest.TestCase):
             self.assertEqual(self.manager.hash_password(HASH), HASH)
             execute.assert_not_called()
 
+    def backend_container(self, shared=False):
+        return {"Id": "app-id", "Name": "/real-app-1", "State": {"Running": True},
+                "Config": {"ExposedPorts": {"8080/tcp": {}, "9090/tcp": {}, "53/udp": {}}},
+                "NetworkSettings": {"Ports": {"9090/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9090"}], "8080/tcp": None},
+                                    "Networks": {"shared" if shared else "backend-net": {}}}}
+
+    def test_port_candidates_prioritize_published_tcp_and_exclude_udp(self):
+        self.assertEqual(edge.container_ports(self.backend_container()), [9090, 8080])
+
+    def test_backend_selection_uses_real_container_name_and_stages_network_only(self):
+        pending = set()
+        with mock.patch.object(self.manager, "containers", return_value=[self.backend_container()]), \
+             mock.patch.object(self.manager, "container", return_value={"Id": "proxy", "NetworkSettings": {"Networks": {"shared": {}}}}), \
+             mock.patch.object(edge, "ask", side_effect=["1", "9090"]), mock.patch.object(self.manager, "connect_network") as connect:
+            self.assertEqual(self.manager.backend(pending=pending), "http://real-app-1:9090")
+            connect.assert_not_called()
+        self.assertEqual(pending, {"backend-net"})
+
+    def test_backend_shared_network_does_not_schedule_extra_connections(self):
+        pending = set()
+        with mock.patch.object(self.manager, "containers", return_value=[self.backend_container(shared=True)]), \
+             mock.patch.object(self.manager, "container", return_value={"NetworkSettings": {"Networks": {"shared": {}}}}), \
+             mock.patch.object(edge, "ask", side_effect=["1", "9090"]):
+            self.manager.backend(pending=pending)
+        self.assertEqual(pending, set())
+
+    def test_manual_address_warns_about_loopback_mapping_without_assuming_remote_is_local(self):
+        with mock.patch.object(self.manager, "containers", return_value=[self.backend_container()]), \
+             mock.patch.object(edge, "ask", side_effect=["0", "http://198.51.100.10:9090"]), \
+             mock.patch.object(edge, "yes", return_value=True) as confirm, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.manager.backend(), "http://198.51.100.10:9090")
+            confirm.assert_called_once()
+        self.assertIn("回环地址", output.getvalue())
+
+    def test_simple_add_has_no_application_preset_or_raw_config_and_cancel_changes_nothing(self):
+        before = (self.root / "Caddyfile").read_bytes()
+        with mock.patch.object(edge, "ask", return_value="new.example.test") as ask, \
+             mock.patch.object(edge, "yes", side_effect=[False, False]), \
+             mock.patch.object(self.manager, "backend", return_value="http://app:8000"), \
+             mock.patch.object(self.manager, "apply_with_networks") as apply, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.manager.add()
+            ask.assert_called_once_with("网站域名", None)
+            apply.assert_not_called()
+        self.assertNotIn("MetaCubeXD", output.getvalue())
+        self.assertNotIn("reverse_proxy", output.getvalue())
+        self.assertEqual((self.root / "Caddyfile").read_bytes(), before)
+
+    def test_compact_menu_keeps_common_commands_and_groups_advanced_actions(self):
+        for answers, expected in ((["1"], "add"), (["2", "4"], "disable"), (["6", "2"], "containers"), (["5"], "update"), (["0"], None)):
+            with mock.patch.object(edge, "ask", side_effect=answers), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(edge.menu(), expected)
+                self.assertNotIn("MetaCubeXD", output.getvalue())
+
+    def test_network_change_is_rolled_back_if_site_apply_fails(self):
+        original = {"services": {"caddy": {"image": edge.IMAGE}}}
+        edge.write_json(self.root / edge.OVERLAY, original)
+        proxy = {"Id": "proxy", "NetworkSettings": {"Networks": {"shared": {}}}}
+        joined = {"Id": "proxy", "NetworkSettings": {"Networks": {"shared": {}, "new-network": {}}}}
+        with mock.patch.object(self.manager, "container", side_effect=[proxy, joined]), \
+             mock.patch.object(self.manager, "connect_network"), \
+             mock.patch.object(self.manager, "apply", side_effect=edge.Error("failed")), mock.patch.object(edge, "run") as execute:
+            with self.assertRaises(edge.Error):
+                self.manager.apply_with_networks([site()], {"new-network"})
+            execute.assert_called_once_with(["docker", "network", "disconnect", "new-network", "proxy"])
+        self.assertEqual(edge.read_json(self.root / edge.OVERLAY), original)
+
     def test_fresh_install_refuses_an_existing_compose_project(self):
         destination = self.root.parent / "fresh"
         destination.mkdir()
