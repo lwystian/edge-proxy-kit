@@ -34,6 +34,17 @@ class Error(Exception):
     pass
 
 
+@contextlib.contextmanager
+def update_step(name):
+    print(name + "……", flush=True)
+    try:
+        with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink):
+            yield
+    except Exception as error:
+        detail = str(error) if isinstance(error, Error) else type(error).__name__
+        raise Error(name + "失败：" + detail + "；请用 ./deploy.sh doctor 或 ./deploy.sh logs 排查。") from None
+
+
 def run(args, data=None, cwd=None, timeout=120):
     try:
         result = subprocess.run([str(a) for a in args], input=data, cwd=cwd, timeout=timeout,
@@ -970,31 +981,32 @@ def dispatch(manager, args):
 
 
 def update_image(manager, image=None):
-    manager.adapt(manager.current())
-    obj = manager.container()
-    old_overlay = (manager.root / OVERLAY).read_bytes() if (manager.root / OVERLAY).exists() else None
-    overlay = json.loads(old_overlay) if old_overlay else {"services": {}}
-    service = manager.settings["service"]
-    if image and not re.fullmatch(r"(?:docker.io/library/)?caddy:\d+\.\d+\.\d+-alpine(?:@sha256:[a-f0-9]{64})?", image):
-        raise Error("请使用官方 Caddy 明确版本，例如 caddy:2.11.4-alpine，可附 sha256。")
-    print("更新入口镜像，先备份配置。")
-    manager.backup()
-    try:
-        if image:
-            overlay.setdefault("services", {}).setdefault(service, {})["image"] = image
-            write_json(manager.root / OVERLAY, overlay)
-        manager.compose("config", "--quiet")
-        manager.compose("pull", service, timeout=900)
-        manager.compose("up", "-d", "--no-deps", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "90", service, timeout=150)
-        manager.doctor()
-    except Exception:
-        # 精确使用更新前本机镜像 ID，避免标签已被拉取覆盖导致回退仍运行新镜像。
-        rollback = json.loads(old_overlay) if old_overlay else {"services": {}}
-        rollback.setdefault("services", {}).setdefault(service, {})["image"] = obj["Image"]
-        write_json(manager.root / OVERLAY, rollback)
-        manager.compose("up", "-d", "--no-deps", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "90", service, timeout=150)
-        raise Error("镜像更新失败，已按原镜像 ID 恢复；覆盖配置暂时固定原镜像，下次更新请显式指定 --image。")
-    print("入口镜像及配置检查完成。证书、后端应用及业务数据保留。")
+    with update_step("备份配置"):
+        manager.adapt(manager.current())
+        obj = manager.container()
+        old_overlay = (manager.root / OVERLAY).read_bytes() if (manager.root / OVERLAY).exists() else None
+        overlay = json.loads(old_overlay) if old_overlay else {"services": {}}
+        service = manager.settings["service"]
+        if image and not re.fullmatch(r"(?:docker.io/library/)?caddy:\d+\.\d+\.\d+-alpine(?:@sha256:[a-f0-9]{64})?", image):
+            raise Error("请使用官方 Caddy 明确版本，例如 caddy:2.11.4-alpine，可附 sha256。")
+        manager.backup()
+    with update_step("更新服务"):
+        try:
+            if image:
+                overlay.setdefault("services", {}).setdefault(service, {})["image"] = image
+                write_json(manager.root / OVERLAY, overlay)
+            manager.compose("config", "--quiet")
+            manager.compose("pull", service, timeout=900)
+            manager.compose("up", "-d", "--no-deps", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "90", service, timeout=150)
+            manager.doctor()
+        except Exception:
+            # 精确使用更新前本机镜像 ID，避免标签已被拉取覆盖导致回退仍运行新镜像。
+            rollback = json.loads(old_overlay) if old_overlay else {"services": {}}
+            rollback.setdefault("services", {}).setdefault(service, {})["image"] = obj["Image"]
+            write_json(manager.root / OVERLAY, rollback)
+            manager.compose("up", "-d", "--no-deps", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "90", service, timeout=150)
+            raise Error("镜像更新失败，已按原镜像 ID 恢复；覆盖配置暂时固定原镜像，下次更新请显式指定 --image。")
+    print("更新完成。")
 
 
 def menu():
@@ -1035,7 +1047,7 @@ def main():
     if sys.platform != "linux" or os.geteuid() != 0:
         raise Error("请在 Linux amd64/arm64 服务器使用 root 或 sudo 运行；help 不需要权限。")
     if args.command == "update" and not args.image_only:
-        with lock(SOURCE):
+        with update_step("检查更新"), lock(SOURCE):
             changed = sync_code()
         if changed:
             values = [sys.executable, str(SOURCE / "edge.py"), "update", "--image-only"]

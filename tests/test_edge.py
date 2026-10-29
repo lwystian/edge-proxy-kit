@@ -377,6 +377,24 @@ class EdgeTests(unittest.TestCase):
         self.assertEqual(compose.call_args_list, [mock.call("stop", "caddy"), mock.call("rm", "-f", "caddy")])
         self.assertEqual((self.root / "data/cert-marker").read_text(), "keep")
 
+    def test_update_output_is_four_lines_and_diagnostics_still_run(self):
+        def noisy_sync():
+            print("commit identifiers and history")
+            return False
+        with mock.patch.object(sys, "argv", ["deploy.sh", "update", "--root", str(self.root)]), mock.patch.object(sys, "platform", "linux"), mock.patch.object(edge.os, "geteuid", return_value=0, create=True), mock.patch.object(edge, "SOURCE", self.root), mock.patch.object(edge, "lock", return_value=contextlib.nullcontext()), mock.patch.object(edge, "sync_code", side_effect=noisy_sync), mock.patch.object(edge, "Manager", return_value=self.manager), mock.patch.object(self.manager, "current", return_value=""), mock.patch.object(self.manager, "adapt"), mock.patch.object(self.manager, "container", return_value={"Image": "sha256:" + "a" * 64}), mock.patch.object(self.manager, "backup", side_effect=lambda: print("backup directory")) as backup, mock.patch.object(self.manager, "compose") as compose, mock.patch.object(self.manager, "doctor", side_effect=lambda: print("container DNS and port diagnostics")) as doctor, contextlib.redirect_stdout(io.StringIO()) as output:
+            edge.main()
+        self.assertEqual(output.getvalue().splitlines(), ["检查更新……", "备份配置……", "更新服务……", "更新完成。"])
+        backup.assert_called_once_with()
+        doctor.assert_called_once_with()
+        self.assertIn(mock.call("pull", "caddy", timeout=900), compose.call_args_list)
+
+    def test_update_failure_identifies_stage_and_restores_stdout(self):
+        with mock.patch.object(self.manager, "current", return_value=""), mock.patch.object(self.manager, "adapt"), mock.patch.object(self.manager, "container", return_value={}), mock.patch.object(self.manager, "backup", side_effect=edge.Error("test disk failure")), contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(edge.Error, "备份配置失败.*test disk failure.*doctor"):
+                edge.update_image(self.manager)
+            print("stdout restored")
+        self.assertEqual(output.getvalue().splitlines(), ["备份配置……", "stdout restored"])
+
     def test_image_update_failure_uses_previous_image_id(self):
         with mock.patch.object(edge, "yes", return_value=True), mock.patch.object(self.manager, "current", return_value=""), \
              mock.patch.object(self.manager, "adapt"), mock.patch.object(self.manager, "container", return_value={"Image": "sha256:" + "a" * 64}), \

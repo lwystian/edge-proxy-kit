@@ -2,6 +2,8 @@
 """显式 --run 才创建临时 Docker 项目；不连接生产服务器。"""
 import base64
 import copy
+import contextlib
+import io
 import hashlib
 import http.client
 import json
@@ -199,8 +201,9 @@ HTTPServer(('0.0.0.0',8000),Handler).serve_forever()
             assert len(list((root / "backups").glob("edge-*"))) == 1
             print("PASS 配置备份及恢复、加载失败自动回退、原有网站保持可用")
             ca_before = (root / "data/caddy/pki/authorities/local/root.crt").read_bytes()
-            with mock.patch.object(edge, "yes", return_value=True):
+            with contextlib.redirect_stdout(io.StringIO()) as update_output:
                 edge.update_image(manager)
+            assert update_output.getvalue().splitlines() == ["备份配置……", "更新服务……", "更新完成。"]
             assert network in manager.container()["NetworkSettings"]["Networks"]
             assert request("legacy.test")[1] == b"legacy-ok"
             assert (root / "data/caddy/pki/authorities/local/root.crt").read_bytes() == ca_before
