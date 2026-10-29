@@ -890,9 +890,11 @@ def sync_code():
     remote = git("for-each-ref", "--format=%(upstream:remotename)", "refs/heads/" + branch)
     if not remote or remote == "." or remote.startswith("-"):
         raise Error("当前分支需要配置远程 upstream。")
+    print("检查更新……", flush=True)
     git("fetch", "--quiet", "--", remote)
     before, after = git("rev-parse", "HEAD"), git("rev-parse", "@{upstream}^{commit}")
     if before == after:
+        print("项目文件已是最新版。")
         return False
     if git("merge-base", before, after) != before:
         raise Error("分支不能快进，未强制合并。")
@@ -904,7 +906,7 @@ def sync_code():
             raise Error("远程版本包含私有运行配置，拒绝自动更新。")
     compile(git("show", after + ":edge.py"), "edge.py", "exec")
     git("merge", "--ff-only", "--no-overwrite-ignore", after)
-    print("工具代码已快进更新；旧提交仍可通过 Git 历史查看。", flush=True)
+    print("项目文件已更新。", flush=True)
     return True
 
 

@@ -412,7 +412,7 @@ class GitUpdateTests(unittest.TestCase):
         self.git(self.seed, "clone", "--bare", str(self.seed), str(self.remote))
         self.git(self.seed, "remote", "add", "origin", str(self.remote))
         self.git(self.seed, "push", "-u", "origin", "main")
-        self.git(self.seed, "clone", "-b", "main", str(self.remote), str(self.root))
+        self.git(self.seed, "clone", "--depth", "1", "--no-tags", "--no-local", "-b", "main", str(self.remote), str(self.root))
 
     def git(self, directory, *args):
         return edge.run(["git", "-c", "core.fsmonitor=false", "-c", "safe.directory=" + directory.as_posix()] + list(args), cwd=directory)
@@ -427,6 +427,7 @@ class GitUpdateTests(unittest.TestCase):
         self.git(self.seed, "push")
 
     def test_code_fast_forward_preserves_private_files(self):
+        self.assertEqual(self.git(self.root, "rev-parse", "--is-shallow-repository").strip(), "true")
         edge.private(self.root / "Caddyfile", "private site")
         edge.private(self.root / "data/cert-marker", "private cert")
         self.publish()

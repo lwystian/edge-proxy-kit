@@ -11,7 +11,7 @@
 需要 Linux、Docker Engine、Compose 插件、Bash、Python 3.8+ 和 Git，以 root 或 sudo 运行。不限定发行版及安装目录。
 
 ```bash
-git clone https://github.com/lwystian/edge-proxy-kit.git
+git clone --depth 1 --no-tags https://github.com/lwystian/edge-proxy-kit.git
 cd edge-proxy-kit
 ./deploy.sh
 ```
@@ -85,7 +85,7 @@ WebSocket 自动转发。API 密钥、登录和跨域策略仍由后端应用负
 | `enable` / `disable` / `remove` | 启用、停用、移除网站规则 |
 | `status` / `doctor` | 查看状态、诊断配置和 DNS |
 | `logs` / `logs -f` | 查看日志、持续跟踪 |
-| `update` | 自动快进更新工具代码并更新入口镜像 |
+| `update` | 自动更新项目文件和入口镜像 |
 | `start` / `stop` / `restart` / `reload` | 启动、停止、重启、验证后平滑加载 |
 | `backup` / `restore` | 配置备份、校验并恢复网站规则 |
 | `help` | 完整命令说明 |
@@ -96,7 +96,7 @@ WebSocket 自动转发。API 密钥、登录和跨域策略仍由后端应用负
 ./deploy.sh update
 ```
 
-代码有本地改动、分叉或文件冲突时停止，不强制覆盖。镜像默认保留已配置版本；切换版本可用 `./deploy.sh update --image caddy:版本号-alpine`。只更新镜像可加 `--image-only`。镜像更新可能短暂中断入口，失败会尝试按原本机镜像 ID 恢复，不重启业务容器。
+正常更新只显示检查和更新结果，不显示提交号、分支或历史记录。项目文件有本地改动或更新冲突时停止，不强制覆盖。镜像默认保留已配置版本；切换版本可用 `./deploy.sh update --image caddy:版本号-alpine`。只更新镜像可加 `--image-only`。镜像更新可能短暂中断入口，失败会尝试按原本机镜像 ID 恢复，不重启业务容器。
 
 ## 数据与边界
 
